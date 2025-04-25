@@ -13,6 +13,7 @@ import numpy as np
 
 import gcsfs
 from google.cloud import storage
+from google.cloud.exceptions import ClientError
 
 from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexGroupNode, LatexMacroNode
 from pylatexenc.latex2text import LatexNodes2Text
@@ -54,16 +55,16 @@ PROMPT_TEMPLATE = (
     "1. Extract ONLY the **top-level** institution names and the city associated with the authors.\n"
     "2. Ignore any sub-units such as departments, schools, laboratories, or colleges (e.g., 'School of ECE' or 'Department of Physics').\n"
     "3. Ignore research collaborations, projects, or experiments.\n"
-    "4. Convert any LaTeX characters to unicode.\n"
-    "5. Format: Each academic institution must be numbered on a new line, exactly as follows:\n"
+    "4. If NO institutions can be found return exactly:\n"
+    "   null\n"
+    "5. If NO city is found for an institution, omit city from the output.\n"
+    "6. DO NOT include explanations, descriptions, or any other text\n"
+    "7. Convert any LaTeX characters to unicode.\n"
+    "8. Format: Each academic institution must be numbered on a new line, exactly as follows:\n"
     "   1. Institution Name 1, City\n"
     "   2. Institution Name 2, City\n"
-    "6. If an institution appears more than once, output it only once.\n"
-    "7. If NO institutions can be found return exactly:\n"
-    "   null\n"
-    "9. If NO city is found for an institution, omit city from the output.\n"
-    "8. DO NOT include explanations, descriptions, or any other text\n"
-    "9. ONLY include the numbered list of institutions OR 'null'.\n\n"
+    "9. If an institution appears more than once, output it only once.\n"
+    "10. ONLY include the numbered list of institutions OR 'null'.\n\n"
     "### INPUT TEXT:\n"
     "{input_text}\n\n"
 )
@@ -186,20 +187,19 @@ def extract_pre_abstract_content(tar_path, tex_main):
             wrapped_file = io.TextIOWrapper(fp, newline=None, encoding='utf-8') #universal newlines
             source_text = pre_format(wrapped_file.read())
     except UnicodeDecodeError:
-        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='rb') as f:
-            raw_data = f.read(10000)
-            result = chardet.detect(raw_data)
-            detected_encoding = result["encoding"]
         try:
             with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_tar:
                 fp = in_tar.extractfile(tex_main)
+                raw_data = in_tar.extractfile(tex_main).peek(10000)
+                result = chardet.detect(raw_data)
+                detected_encoding = result["encoding"]
                 wrapped_file = io.TextIOWrapper(
                     fp, 
                     newline=None, 
                     encoding=detected_encoding, 
                     errors="replace"
                 ) #universal newlines
-                source_text = pre_format(wrapped_file.read())
+                source_text = wrapped_file.read()
         except Exception as e:
             tqdm.write(f"Failed to read {tex_file_path} with detected encoding {detected_encoding}: {e}")
             return None
@@ -396,11 +396,14 @@ def send_one_submission_to_gemini(arx_id, verbose=False):
                 if "Institution Name" in res:
                     res = None
                     continue
+                if "1. Institution 1" in res:
+                    res = None
+                    continue
                 else:
                     break # from src_list
             if (res is not None) and not (res.startswith("null") or res.startswith("1. null")):
                 return res
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ClientError) as e:
         # Probably not a latex source paper
         pass
     txt_path = f'txt/arxiv/{yymm}/{arx_id}.txt'
@@ -427,7 +430,7 @@ def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False):
     paper_id = arx_id.split("v")[0]
 
     # Phase 1 - get names from text
-    gemini_res = send_one_submission_to_gemini(arx_id, verbose=False)
+    gemini_res = send_one_submission_to_gemini(arx_id, verbose=verbose)
     results = []
     found_institutions = False
     if gemini_res and gemini_res.strip().lower() != "null":
@@ -439,16 +442,11 @@ def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False):
     if not found_institutions:
         results.append((folder, "null"))
 
-    # Phase 2 - get ror match for names
-    for institution in results:
-        pass
-    final_results = results
-
     if lock and pbar:
         with lock:
             pbar.update(1)
 
-    return final_results
+    return results
 
 def process_tex_files(article_list, max_files=None, max_workers=5):
     start_time = time.time()
@@ -462,17 +460,23 @@ def process_tex_files(article_list, max_files=None, max_workers=5):
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
     #, tqdm(total=estimated_tex_files, desc="Processing .tex files") as pbar:
         future_to_article = {
-            executor.submit(get_single_file_results, arx_id, lock, pbar=None): arx_id
+            executor.submit(get_single_file_results, arx_id, lock=None, pbar=None): arx_id
             for arx_id in article_list
         }
 
         for future in as_completed(future_to_article):
             article = future_to_article[future]
             try:
-                article_results = future.result()
+                article_results = future.result(timeout=5)
                 results.extend(article_results)
             except Exception as e:
-                print(f"❌ Error processing article '{article}': {e}")
+                time.sleep(.5)
+                try:
+                    article_results = get_single_file_results(article)
+                    results.extend(article_results)
+                except Exception as e2:
+                    print(f"❌ Error processing article '{article}': {e}")
+                    results.append((article, 'error'))
 
     total_time = time.time() - start_time
     print(f"✅ Total processing time: {total_time:.2f} seconds")
