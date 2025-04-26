@@ -550,7 +550,7 @@ class rorFinder:
         model_bucket_loc = 'institutional-extract-scratch'
         dest_blob_name = "models/ror_index.zip"
         local_index = "ror_index"
-        os.chdir("/home/jupyter/metadata-vertexai/")
+        #os.chdir("/home/jupyter/metadata-vertexai/")
 
 
         embedding = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
