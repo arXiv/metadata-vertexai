@@ -18,12 +18,22 @@ from google.cloud.exceptions import ClientError
 from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexGroupNode, LatexMacroNode
 from pylatexenc.latex2text import LatexNodes2Text
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import threading
 
 import time
 import vertexai
 from vertexai.generative_models import GenerativeModel
+
+# Phase 2
+from langchain.docstore.document import Document
+from langchain_google_vertexai import VertexAI
+from langchain.vectorstores import FAISS
+#from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+
 
 PROJECT_ID = "arxiv-development"
 PRD_PROJECT = 'arxiv-production'
@@ -429,19 +439,20 @@ def send_one_submission_to_gemini(arx_id, verbose=False):
 def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False):
     paper_id = arx_id.split("v")[0]
 
-    # Phase 1 - get names from text
+    # Phase 1 - get names from text + Phase 2
     gemini_res = send_one_submission_to_gemini(arx_id, verbose=verbose)
     results = []
     found_institutions = False
     if gemini_res and gemini_res.strip().lower() != "null":
             for institution in gemini_res.split("\n"):
-                clean_name = institution.strip()
+                clean_name = institution.split('.', 1)[-1].strip()
                 if clean_name:
-                    results.append((paper_id, clean_name))
+                    ror = ROR_FINDER.get_ror(clean_name)
+                    results.append((paper_id, clean_name, ror))
                     found_institutions = True
     if not found_institutions:
-        results.append((folder, "null"))
-
+        results.append((folder, "null", "null")) 
+    
     if lock and pbar:
         with lock:
             pbar.update(1)
@@ -463,23 +474,186 @@ def process_tex_files(article_list, max_files=None, max_workers=5):
             executor.submit(get_single_file_results, arx_id, lock=None, pbar=None): arx_id
             for arx_id in article_list
         }
-
-        for future in as_completed(future_to_article):
-            article = future_to_article[future]
-            try:
-                article_results = future.result(timeout=5)
-                results.extend(article_results)
-            except Exception as e:
-                time.sleep(.5)
+        successes = []
+        try:
+            for future in as_completed(future_to_article, timeout=120):
+                article = future_to_article[future]
                 try:
-                    article_results = get_single_file_results(article)
+                    article_results = future.result(timeout=5)
                     results.extend(article_results)
-                except Exception as e2:
-                    print(f"❌ Error processing article '{article}': {e}")
-                    results.append((article, 'error'))
+                    successes.append(article)
+                except Exception as e:
+                    time.sleep(.5)
+                    try:
+                        article_results = get_single_file_results(article)
+                        results.extend(article_results)
+                        successes.append(article)
+                    except Exception as e2:
+                        print(f"❌ Error processing article '{article}': {e}")
+                        results.append((article, 'error'))
+        except TimeoutError as e_time:
+            failures = [
+                a_id for a_id in future_to_article.values()
+                if not a_id in set(successes)
+            ]
+            for article in failures:
+                results.append((article, 'error'))
+                print(f"❌ Error processing article '{failures}': {e_time}")
 
     total_time = time.time() - start_time
     print(f"✅ Total processing time: {total_time:.2f} seconds")
 
     return results
     
+############################
+## Phase 2
+#############################
+def load_special_cases_ror():
+    docs = []
+    ror_sp_gspath = 'gs://institutional-extract-scratch/reference/special_cases.json'
+    fs = gcsfs.GCSFileSystem()
+    try:
+        with fs.open(ror_sp_gspath, "r", encoding="utf-8") as f:
+            spec_data = json.load(f)
+        for entry in spec:
+            ror_id = entry.get("ror_id", "")
+            name_loc = entry.get("name_loc", "")
+            if name and ror_id:
+                content = f"{name_loc} — {ror_id}"
+                docs.append(Document(page_content=content))
+    except FileNotFoundError:
+        docs = []
+    return docs
+
+ROR_TEMPLATE = """
+You are given an input institution name and a list of ROR entries.
+
+Institution: {question}
+
+Context:
+{context}
+
+From the context, pick the best matching ROR ID. If none match, return "null".
+DO NOT include explanations, descriptions, or any other text — ONLY the ROR ID or 'null'.
+Answer:
+"""
+
+class rorFinder:
+    
+    def __init__(self):
+        self.qa_chain = self.build_qa_chain()
+
+    @staticmethod
+    def build_qa_chain():
+        # Load the index model, training it if needed.
+        model_project = 'arxiv-development'
+        model_bucket_loc = 'institutional-extract-scratch'
+        dest_blob_name = "models/ror_index.zip"
+        local_index = "ror_index"
+        os.chdir("/home/jupyter/metadata-vertexai/")
+
+
+        embedding = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+        client = storage.Client(project=model_project)
+        bucket = client.bucket(model_bucket_loc)
+        blob = bucket.blob(dest_blob_name)
+        RECREATE_INDEX = False
+
+        if RECREATE_INDEX or (not blob.exists()) :
+            ror_gspath = 'gs://institutional-extract-scratch/reference/v1.63-2025-04-03-ror-data_schema_v2.json'
+            fs = gcsfs.GCSFileSystem()
+            with fs.open(ror_gspath, "r", encoding="utf-8") as f:
+                ror_data = json.load(f)
+
+
+            docs = []
+            docs = load_special_cases_ror()
+            for i,entry in enumerate(ror_data):
+                ror_id = entry.get("id", "")
+                locs = entry.get('locations')
+                loc_name = ""
+                try:
+                    loc_name = f", {locs[0]['geonames_details']['name']}"
+                except KeyError:
+                    pass
+                for name_info in entry.get("names", []):
+                    name = name_info.get("value", "")
+                    if name and ror_id:
+                        # format: "name — ROR_id"
+                        content = f"{name}{loc_name} — {ror_id}"
+                        docs.append(Document(page_content=content))
+
+            print(f"Prepared {len(docs)} vector entries to build FAISS index")
+
+            # Embedding model (recommended: MiniLM)
+            embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+            # Build FAISS index
+            vectorstore = FAISS.from_documents(docs, embedding_model)
+
+            # Save index to local file
+            vectorstore.save_local(local_index)
+            print("ROR vector index built and saved successfully")
+
+            with zipfile.ZipFile(local_index+'.zip', 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(local_index):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        zipf.write(full_path, os.path.relpath(full_path, local_index))
+
+            client = storage.Client(project=model_project)
+            bucket = client.bucket(model_bucket_loc)
+            blob = bucket.blob(dest_blob_name)
+            blob.upload_from_filename(local_index+'.zip')
+
+            print(f'File uploaded to {dest_blob_name}')
+
+        else:
+            if not os.path.exists(local_index):
+                blob.download_to_filename(local_index+'.zip')
+                with zipfile.ZipFile(local_index+'.zip', 'r') as zipf:
+                    zipf.extractall(local_index)
+
+            vectorstore = FAISS.load_local(
+                local_index,
+                embeddings=embedding,
+                allow_dangerous_deserialization=True
+            )
+
+        llm = VertexAI(
+        model_name="gemini-1.5-flash-002",
+        temperature=0,
+        max_output_tokens=512,
+        )
+
+        prompt = PromptTemplate(input_variables=["question", "context"], template=ROR_TEMPLATE)
+
+        #  Build a Retrieval + QA Chain
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 2}),
+            chain_type="stuff",
+            chain_type_kwargs={"prompt": prompt},
+            return_source_documents=True
+        )
+
+        return qa_chain
+
+    @ft.cache
+    def get_ror(self, inst_name):
+        try:
+            response = self.qa_chain.invoke({"query": inst_name})
+            ror_id = response["result"]
+            if ror_id.strip() == 'null':
+                #try without city
+                inst_name_sans = ','.join(inst_name.split(',')[:-1])
+                response = self.qa_chain.invoke({"query": inst_name_sans})
+                ror_id = response["result"]
+
+        except Exception as e:
+            print(f"Error querying {inst_name}: {e}")
+            ror_id = "error"
+        return ror_id.strip()
+    
+ROR_FINDER = rorFinder()
