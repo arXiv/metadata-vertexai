@@ -28,8 +28,7 @@ from vertexai.generative_models import GenerativeModel
 # Phase 2
 from langchain.docstore.document import Document
 from langchain_google_vertexai import VertexAI
-#from langchain.vectorstores import FAISS
-from langchain_community.vectorstores import FAISS
+from langchain.vectorstores import FAISS
 #from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.prompts import PromptTemplate
@@ -438,7 +437,7 @@ def send_one_submission_to_gemini(arx_id, verbose=False):
 # Threaded processing for multiple files
 ##########################
 def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False):
-    #paper_id = arx_id.split("v")[0]
+    paper_id = arx_id.split("v")[0]
 
     # Phase 1 - get names from text + Phase 2
     gemini_res = send_one_submission_to_gemini(arx_id, verbose=verbose)
@@ -449,10 +448,10 @@ def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False):
                 clean_name = institution.split('.', 1)[-1].strip()
                 if clean_name:
                     ror = ROR_FINDER.get_ror(clean_name)
-                    results.append((arx_id, clean_name, ror))
+                    results.append((paper_id, clean_name, ror))
                     found_institutions = True
     if not found_institutions:
-        results.append((arx_id, "null", "null")) 
+        results.append((folder, "null", "null")) 
     
     if lock and pbar:
         with lock:
@@ -460,7 +459,7 @@ def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False):
 
     return results
 
-def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False):
+def process_tex_files(article_list, max_files=None, max_workers=5):
     start_time = time.time()
     if max_files:
         article_list = article_list[:max_files]
@@ -490,8 +489,7 @@ def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False
                         results.extend(article_results)
                         successes.append(article)
                     except Exception as e2:
-                        if verbose: 
-                            print(f"❌ Error processing article '{article}': {e}")
+                        print(f"❌ Error processing article '{article}': {e}")
                         results.append((article, 'error'))
         except TimeoutError as e_time:
             failures = [
@@ -500,12 +498,10 @@ def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False
             ]
             for article in failures:
                 results.append((article, 'error'))
-                if verbose:
-                    print(f"❌ Error processing article '{failures}': {e_time}")
+                print(f"❌ Error processing article '{failures}': {e_time}")
 
     total_time = time.time() - start_time
-    if verbose:
-        print(f"✅ Total processing time: {total_time:.2f} seconds")
+    print(f"✅ Total processing time: {total_time:.2f} seconds")
 
     return results
     
@@ -554,7 +550,7 @@ class rorFinder:
         model_bucket_loc = 'institutional-extract-scratch'
         dest_blob_name = "models/ror_index.zip"
         local_index = "ror_index"
-        #os.chdir("/home/jupyter/metadata-vertexai/")
+        os.chdir("/home/jupyter/metadata-vertexai/")
 
 
         embedding = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -626,7 +622,7 @@ class rorFinder:
             )
 
         llm = VertexAI(
-        model_name="gemini-1.5-flash-002",   # "gemini-1.5-flash-002"
+        model_name="gemini-1.5-flash-002",
         temperature=0,
         max_output_tokens=512,
         )
