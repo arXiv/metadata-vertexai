@@ -100,6 +100,7 @@ if __name__ == "__main__":
     tt = TicToc()
 
     input_ids = set(ids_2311_all)
+    time_code = "2025-04-28"
     save_name = "2311_db"
     sample_size = "all"
     batch_size = 20
@@ -140,11 +141,12 @@ if __name__ == "__main__":
     batches = np.array_split(list(input_ids), len(input_ids)//batch_size)
     tt.tic()
     print(f"Start: {len(input_ids)} in {len(batches)} batches")
-    with open(f"checkpoints/{save_name}_{sample_size}.pkl", 'ab') as cp_fp:
+    with open(f"checkpoints/{save_name}_{sample_size}_{time_code}.pkl", 'ab') as cp_fp:
         res = run_phase_one_in_parallel(batches, cp_fp)
     tt.toc()
     known_res.extend(res)
     res_df = pd.DataFrame.from_records(known_res, columns=['arx_id', 'name', 'ror'])
-    res_df.to_csv(f"gs://institutional-extract-scratch/output/{save_name}_{sample_size}.csv.zip", index=False)
+    res_df.to_csv(f"gs://institutional-extract-scratch/output/{save_name}_{sample_size}_{time_code}.csv.zip", index=False)
+    # manually remove pickle file
     #res_list = format_results(res)
     tt.toc()

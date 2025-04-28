@@ -274,7 +274,7 @@ def extract_pre_abstract_content(tar_path, tex_main):
             except Exception as e:
                 print(
                     f"Failed to read {tar_path}-{tex_main} with"
-                    " detected encoding {detected_encoding}: {e}"
+                    f" detected encoding {detected_encoding}: {e}"
                 )
                 return None
     else:
@@ -295,9 +295,10 @@ def extract_pre_abstract_content(tar_path, tex_main):
                     source_text = in_gz.read()
             except Exception as e:
                 print(
-                    f"Failed to read {tar_path}-{tex_main} with"
-                    " detected encoding {detected_encoding}: {e}"
+                    f"Failed to read {tar_path} with"
+                    f" detected encoding {detected_encoding}: {e}"
                 )
+                return None
 
     # Remove LaTeX comments (lines starting with non-escaped %)
     content = re.sub(r"(?<!\\)%.*", "", source_text)
@@ -511,6 +512,7 @@ BAD_START_PATTERNS = set([
     "1. null",  
 ])
 def check_src_list_with_gemini(src_list_gen, verbose=False):
+    res = None
     for i,src in enumerate(src_list_gen):
         res = query_gemini_api(src)
         if verbose:
@@ -558,7 +560,11 @@ def send_one_submission_to_gemini(arx_id, verbose=False):
     txt_path = f'txt/arxiv/{yymm}/{arx_id}.txt'
     if verbose:
         print(f"Processing {txt_path}")
-    src_list = extract_select_pages_from_txt(txt_path)
+    try:
+        src_list = extract_select_pages_from_txt(txt_path)
+    except (FileNotFoundError, ClientError):
+        src_list = []
+        
     res = None
     for src in src_list:
         res = query_gemini_api(src)
