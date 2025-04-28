@@ -1,5 +1,6 @@
 import tarfile
 import zipfile
+import gzip
 import io
 import os
 import itertools as itr
@@ -15,7 +16,7 @@ import gcsfs
 from google.cloud import storage
 from google.cloud.exceptions import ClientError
 
-from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexGroupNode, LatexMacroNode
+from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexGroupNode, LatexMacroNode, LatexCharsNode
 from pylatexenc.latex2text import LatexNodes2Text
 
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
@@ -66,21 +67,31 @@ PROMPT_TEMPLATE = (
     "1. Extract ONLY the **top-level** institution names and the city associated with the authors.\n"
     "2. Ignore any sub-units such as departments, schools, laboratories, or colleges (e.g., 'School of ECE' or 'Department of Physics').\n"
     "3. Ignore research collaborations, projects, or experiments.\n"
-    "4. If NO institutions can be found return exactly:\n"
+    "4. Ignore email addresses in the INPUT TEXT.\n"
+    "5. If NO institutions can be found return exactly:\n"
     "   null\n"
-    "5. If NO city is found for an institution, omit city from the output.\n"
-    "6. DO NOT include explanations, descriptions, or any other text\n"
-    "7. Convert any LaTeX characters to unicode.\n"
-    "8. Format: Each academic institution must be numbered on a new line, exactly as follows:\n"
+    "6. If NO city is found for an institution, omit city from the output.\n"
+    "7. DO NOT include explanations, descriptions, or any other text\n"
+    "8. Convert any LaTeX characters to unicode.\n"
+    "9. Format: Each academic institution must be numbered on a new line, exactly as follows:\n"
     "   1. Institution Name 1, City\n"
     "   2. Institution Name 2, City\n"
-    "9. If an institution appears more than once, output it only once.\n"
-    "10. ONLY include the numbered list of institutions OR 'null'.\n\n"
+    "10. If an institution appears more than once, output it only once.\n"
+    "11. ONLY include the numbered list of institutions OR 'null'.\n\n"
     "### INPUT TEXT:\n"
     "{input_text}\n\n"
 )
 
+VERIFY_TEMPLATE = """
+Match the institution names in the LIST_OF_NAMES with the contents of the SOURCE_TEXT.
+Answer "True" if ALL the institutions in the LIST_OF_NAMES are present in the SOURCE_TEXT, otherwise answer "False"\n
+Only respond with "True" or "False".
+### LIST_OF_NAMES:\n
+{inst_list}\n\n
 
+### SOURCE_TEXT:\n
+{source_text}\n\n
+""".strip()
 
 
 def find_doc_class(wrapped_file, name_match=False, sub_match=False):
@@ -180,6 +191,55 @@ def source_from_tar(tar_path, tex_main, encoding='utf-8'):
         source_text = pre_format(wrapped_file.read())
         return source_text
 
+def extract_texsuperscript(latex_node_list, res=None):
+    '''for each superscript, get the contents of the next LatexCharsNode'''
+    bailout_macros = set(['abstract', 'subsection'])
+    if res is None:
+        res = []
+    for i, node in enumerate(latex_node_list):
+        sublist = []
+        #print(type(node))
+        try:
+            if node.macroname=='textsuperscript':
+                run_started = False
+                text_list = []
+                for nnode in latex_node_list[i:]:
+                    #print(type(nnode))
+                    if isinstance(nnode, LatexCharsNode):
+                        text_list.append(nnode.latex_verbatim())
+                        run_started = True
+                    elif isinstance(nnode, LatexMacroNode):
+                        if nnode.macroname == '&':
+                            text_list.append('&')
+                        elif run_started:
+                            break
+                    elif not isinstance(nnode, LatexCharsNode):
+                        if run_started:
+                            break
+                if text_list:
+                    res.append(" ".join(text_list))
+        except AttributeError:
+            pass
+        if isinstance(node, LatexMacroNode):
+            try: 
+                if node.macroname in bailout_macros:
+                    break
+                sublist = node.nodeargd.argnlist
+                #print(sublist)
+            except AttributeError:
+                pass
+        if isinstance(node, (LatexGroupNode, LatexEnvironmentNode)):
+            try:
+                sublist = node.nodelist
+                #print(sublist)
+            except AttributeError:
+                pass
+        if isinstance(node, LatexEnvironmentNode) and node.environmentname=='document':
+            break
+        if sublist:
+            extract_texsuperscript(sublist, res)
+    return res
+    
 def extract_pre_abstract_content(tar_path, tex_main):
     """
     Parses a .tex file:
@@ -191,33 +251,57 @@ def extract_pre_abstract_content(tar_path, tex_main):
     bucket = client.bucket(PRD_BUCKET_LOC)
     blob = bucket.blob(tar_path)
     tar_bytes = blob.download_as_bytes()
-    
-    try:
-        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_tar:
-            fp = in_tar.extractfile(tex_main)
-            wrapped_file = io.TextIOWrapper(fp, newline=None, encoding='utf-8') #universal newlines
-            source_text = pre_format(wrapped_file.read())
-    except UnicodeDecodeError:
+    if tar_path.endswith(".tar.gz"):
         try:
             with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_tar:
                 fp = in_tar.extractfile(tex_main)
-                raw_data = in_tar.extractfile(tex_main).peek(10000)
-                result = chardet.detect(raw_data)
-                detected_encoding = result["encoding"]
-                wrapped_file = io.TextIOWrapper(
-                    fp, 
-                    newline=None, 
-                    encoding=detected_encoding, 
-                    errors="replace"
-                ) #universal newlines
-                source_text = wrapped_file.read()
-        except Exception as e:
-            tqdm.write(f"Failed to read {tex_file_path} with detected encoding {detected_encoding}: {e}")
-            return None
+                wrapped_file = io.TextIOWrapper(fp, newline=None, encoding='utf-8') #universal newlines
+                source_text = pre_format(wrapped_file.read())
+        except UnicodeDecodeError:
+            try:
+                with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_tar:
+                    fp = in_tar.extractfile(tex_main)
+                    raw_data = in_tar.extractfile(tex_main).peek(10000)
+                    result = chardet.detect(raw_data)
+                    detected_encoding = result["encoding"]
+                    wrapped_file = io.TextIOWrapper(
+                        fp, 
+                        newline=None, 
+                        encoding=detected_encoding, 
+                        errors="replace"
+                    ) #universal newlines
+                    source_text = wrapped_file.read()
+            except Exception as e:
+                print(
+                    f"Failed to read {tar_path}-{tex_main} with"
+                    " detected encoding {detected_encoding}: {e}"
+                )
+                return None
+    else:
+        try:
+            with gzip.open(io.BytesIO(tar_bytes), 'rt', encoding='utf-8') as in_gz:
+                source_text = in_gz.read()
+        except UnicodeDecodeError:
+            try:
+                with gzip.open(io.BytesIO(tar_bytes), 'rb') as in_gz:
+                    raw_data = in_gz.peek(10000)
+                    result = chardet.detect(raw_data)
+                    detected_encoding = result["encoding"]
+                with gzip.open(
+                    io.BytesIO(tar_bytes),
+                    'rt', 
+                    encoding=detected_encoding
+                ) as in_gz:
+                    source_text = in_gz.read()
+            except Exception as e:
+                print(
+                    f"Failed to read {tar_path}-{tex_main} with"
+                    " detected encoding {detected_encoding}: {e}"
+                )
 
     # Remove LaTeX comments (lines starting with non-escaped %)
     content = re.sub(r"(?<!\\)%.*", "", source_text)
-    res_list = []
+    #res_list = []
 
     # try parsing latex:
     auth_macros = set([
@@ -226,6 +310,9 @@ def extract_pre_abstract_content(tar_path, tex_main):
         "affiliation", "affil", "affiliations",
         "address",
         "cmsinstitute",
+    ])
+    supstr = set([
+        "\\textsuperscript",
     ])
     latex_extracted_institutions = []
     try:
@@ -244,6 +331,9 @@ def extract_pre_abstract_content(tar_path, tex_main):
                         latex_extracted_institutions.append(follow_node.latex_verbatim())
                 except IndexError:
                     pass
+            if any(pat in lx for lx in latex_extracted_institutions for pat in supstr):
+                sup_res = extract_texsuperscript(nodelist)
+                latex_extracted_institutions.extend(sup_res)
         else:
             doc = [
                 node for node in nodelist
@@ -262,6 +352,9 @@ def extract_pre_abstract_content(tar_path, tex_main):
                             latex_extracted_institutions.append(follow_node.latex_verbatim())
                     except IndexError:
                         pass
+                if any(pat in lx for lx in latex_extracted_institutions for pat in supstr):
+                    sup_res = extract_texsuperscript(doc[0].nodelist)
+                    latex_extracted_institutions.extend(sup_res)
         if latex_extracted_institutions:
             #res_list.append(latex_extracted_institutions)
             yield "\n".join(latex_extracted_institutions)
@@ -364,7 +457,7 @@ def extract_select_pages_from_txt(txt_path):
 
 def query_gemini_api(input_text):
     """
-    Sends a request to the Gemini API to extract potential institution names.
+    Sends a request to the Gemini API to judge quality of result.
     """
     prompt = PROMPT_TEMPLATE.format(input_text=input_text)
 
@@ -382,9 +475,58 @@ def query_gemini_api(input_text):
         print("API request failed or empty response")
         return None
 
+def verify_with_gemini_api(inst_list, source_text, template=None):
+    """
+    Sends a request to the Gemini API to extract potential institution names.
+    """
+    if template:
+        VERIFY_TEMPLATE = template
+    prompt = VERIFY_TEMPLATE.format(inst_list=inst_list, source_text=source_text)
+
+    start_time = time.time()
+    response = model.generate_content(prompt)
+    end_time = time.time()
+
+    timecost = end_time - start_time
+
+    if response and response.text:
+        clean_response = response.text
+        # print(f"Execution time: {timecost:.4f} seconds")
+        return clean_response
+    else:
+        print("API request failed or empty response")
+        return None
+    
 ##########################
 # Process one
 ##########################
+BAD_IN_PATTERNS = set([
+    "Variable not found",
+    "Variable, null",
+    "Institution Name",
+    "1. Institution 1",  
+])
+BAD_START_PATTERNS = set([
+    "null",
+    "1. null",  
+])
+def check_src_list_with_gemini(src_list_gen, verbose=False):
+    for i,src in enumerate(src_list_gen):
+        res = query_gemini_api(src)
+        if verbose:
+            print(f"{i}: {src}\n")
+            print(res)
+        if any((res.startswith(pat)) for pat in BAD_START_PATTERNS):
+            res = None
+            continue
+        if any((pat in res) for pat in BAD_IN_PATTERNS):
+            res = None
+            continue
+        else:
+            break # from src_list
+    return res    
+
+
 def send_one_submission_to_gemini(arx_id, verbose=False):
     yymm = arx_id.split(".")[0]
     paper_id = arx_id.split("v")[0]
@@ -395,28 +537,24 @@ def send_one_submission_to_gemini(arx_id, verbose=False):
         candidate_files = find_main_tex_source_in_tar(tar_path, all_found=True)
         for c_file in candidate_files:
             src_list_gen = extract_pre_abstract_content(tar_path, c_file)
-            res = None
-            for i,src in enumerate(src_list_gen):
-                res = query_gemini_api(src)
-                if verbose:
-                    print(f"{i}: {src}\n")
-                    print(res)
-                if res.startswith("null") or res.startswith("1. null"):
-                    res = None
-                    continue
-                if "Institution Name" in res:
-                    res = None
-                    continue
-                if "1. Institution 1" in res:
-                    res = None
-                    continue
-                else:
-                    break # from src_list
+            res = check_src_list_with_gemini(src_list_gen, verbose=verbose)
             if (res is not None) and not (res.startswith("null") or res.startswith("1. null")):
                 return res
     except (FileNotFoundError, ClientError) as e:
-        # Probably not a latex source paper
+        # Probably single file latex or not a latex source paper
         pass
+    ## Is it gz?
+    gz_path = f"ftp/arxiv/papers/{yymm}/{paper_id}.gz"
+    if verbose:
+        print(f"Processing {gz_path}")
+    try:
+        src_list_gen = extract_pre_abstract_content(gz_path, None)
+        res = check_src_list_with_gemini(src_list_gen, verbose=verbose)
+        if (res is not None) and not (res.startswith("null") or res.startswith("1. null")):
+            return res
+    except (ClientError):
+        pass
+    # check text
     txt_path = f'txt/arxiv/{yymm}/{arx_id}.txt'
     if verbose:
         print(f"Processing {txt_path}")
@@ -472,7 +610,7 @@ def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
     #, tqdm(total=estimated_tex_files, desc="Processing .tex files") as pbar:
         future_to_article = {
-            executor.submit(get_single_file_results, arx_id, lock=None, pbar=None): arx_id
+            executor.submit(get_single_file_results, arx_id, lock=None, pbar=None): str(arx_id)
             for arx_id in article_list
         }
         successes = []
@@ -546,6 +684,7 @@ class rorFinder:
     
     def __init__(self):
         self.qa_chain = self.build_qa_chain()
+        self.ror_cache = {}
 
     @staticmethod
     def build_qa_chain():
@@ -636,7 +775,7 @@ class rorFinder:
         #  Build a Retrieval + QA Chain
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 2}),
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 5}),
             chain_type="stuff",
             chain_type_kwargs={"prompt": prompt},
             return_source_documents=True
@@ -644,16 +783,21 @@ class rorFinder:
 
         return qa_chain
 
-    @ft.cache
+    #@ft.cache # tends to cache issues too, so we rolled out own
     def get_ror(self, inst_name):
+        cache_lookup = self.ror_cache.get(inst_name)
+        if cache_lookup:
+            return cache_lookup
         try:
             response = self.qa_chain.invoke({"query": inst_name})
-            ror_id = response["result"]
-            if ror_id.strip() == 'null':
+            ror_id = response["result"].strip()
+            if ror_id == 'null':
                 #try without city
                 inst_name_sans = ','.join(inst_name.split(',')[:-1])
                 response = self.qa_chain.invoke({"query": inst_name_sans})
-                ror_id = response["result"]
+                ror_id = response["result"].strip()
+            if ror_id != 'null':
+                self.ror_cache[inst_name] = ror_id
 
         except Exception as e:
             print(f"Error querying {inst_name}: {e}")
