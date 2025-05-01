@@ -9,8 +9,9 @@ import regex as re
 import chardet
 from tqdm.auto import tqdm
 
-import pandas as pd
-import numpy as np
+#import pandas as pd
+#import numpy as np
+import json
 
 import gcsfs
 from google.cloud import storage
@@ -44,67 +45,38 @@ PRD_BUCKET_LOC = 'arxiv-production-data'
 vertexai.init(project=PROJECT_ID, location="us-central1")
 model = GenerativeModel("gemini-1.5-flash-002")
 
-OLD_PROMPT_TEMPLATE = (
-    "Extract the institutions that the authors of the following LaTeX document are affiliated with.\n\n"
-    "### STRICT OUTPUT REQUIREMENTS:\n"
-    "1. Extract ONLY the institution names associated with the authors, with no additional text.\n"
-    "2. Ignore research collaborations, projects, or experiments.\n"
-    "3. Format: Each academic institution must be numbered on a new line, exactly as follows:\n"
-    "   1. Institution Name 1\n"
-    "   2. Institution Name 2\n"
-    "4. If an institution appears more than once, output it only once.\n"
-    "5. If NO institutions can be found, return exactly:\n"
-    "   null\n"
-    "6. DO NOT include explanations, descriptions, or any other text—ONLY the numbered list or 'null'.\n\n"
-    "### INPUT TEXT:\n"
-    "{input_text}\n\n"
-)
-
-PROMPT_TEMPLATE_V4_edited = (
-    "You are an expert in recognizing organization names in text and latex input."
-    "Identify the authors' institutions in the following INPUT TEXT below.\n\n"
-    "### STRICT OUTPUT REQUIREMENTS:\n"
-    "1. Extract ONLY the **top-level** institution names and the city associated with the authors.\n"
-    "2. Ignore any sub-units such as departments, schools, laboratories, or colleges (e.g., 'School of ECE' or 'Department of Physics').\n"
-    "3. Ignore research collaborations, projects, or experiments.\n"
-    "4. Ignore email addresses in the INPUT TEXT.\n"
-    "5. If NO institutions can be found return exactly:\n"
-    "   null\n"
-    "6. If NO city is found for an institution, omit city from the output.\n"
-    "7. DO NOT include explanations, descriptions, or any other text\n"
-    "8. Convert any LaTeX characters to unicode.\n"
-    "9. Format: Each academic institution must be numbered on a new line, exactly as follows:\n"
-    "   1. Institution Name 1, City\n"
-    "   2. Institution Name 2, City\n"
-    "10. If an institution appears more than once, output it only once.\n"
-    "11. ONLY include the numbered list of institutions OR 'null'.\n\n"
-    "### INPUT TEXT:\n"
-    "{input_text}\n\n"
-)
-
-### V5 with edits
+### V6 JSON
 PROMPT_TEMPLATE = """
-You are an expert in recognizing institution names and locations in text and latex input.
-Identify the authors' institutions in the following INPUT TEXT below.
-### STRICT OUTPUT REQUIREMENTS:
-1. Extract ONLY the **top-level** institution names and the associated city, if present in the INPUT TEXT.
-2. Ignore any sub-units such as departments, schools, laboratories, or colleges (e.g., 'School of ECE' or 'Department of Physics').
-3. Ignore research collaborations, projects, or experiments.
-4. Output Format:
-    - Each institution should be on a separate line with extra NO numbering, punctuation, or bullet points.
-    - Do NOT include explanations, descriptions, or any other text — ONLY the institution list or 'null'
-    - Follow this pseudocode to generate the output list:
-    ```
-    if no institutions are found, then output "null".
+TASK: Follow the directions to generate output from the SOURCE_TEXT as descibed in the OUTPUT_FORMAT directions.
+Follow the directions below:
+ - Find all potential organizations in the SOURCE_TEXT.
+ - Expand abbreviations and acronyms of potential organization names.
+ - When organizations are listed together at an address, treat each organization as a separate entity.
+ - When organizations are listed together at an address, expand any acronyms as a separate entity.
+ - Identify any locations associated explicity associated with any of the potential organizations.
+ - When organizations are listed together at a single address, ONLY associate the address with the last organization in the list.
+ - Ignore any sub-units like departments or colleges.
+
+### OUTPUT_FORMAT:
+ - The output should be valid utf-8 line json
+ - Output one json Object per line.
+ - Do not return a json Array.
+ - Replace any latex escape sequences in the output with utf-8 characters
+ - double-escape all backslashes
+ - Only report the main organizations like universities, universi, commissions, foundations or corporations.
+ - Ignore sub-units like department, dipartimento, or college.
+ - Follow this pseudocode to generate the output:
+```
+    if no organizations are found, then output "null".
     else
-        for each institution
-            if institution is associated with a city
-                then output the instituion name and city separated by a comma.
-            else 
-                output only the institution name
-    ```
-### INPUT TEXT:
-{input_text}\n
+        for each organization
+            let org_name be the organization name.
+            let city be "" unless you identied a city for this organization
+            let country be "" unless you identified a country location for this organization
+            output a json Object with this format: {{"name":org_name, "city":city , "country":country}}
+```
+### SOURCE_TEXT:
+{input_text}\n\n
 """.strip()
 
 
@@ -120,19 +92,25 @@ Only respond with "True" or "False".
 """.strip()
 
 
-def find_doc_class(wrapped_file, name_match=False, sub_match=False):
+def find_doc_class(wrapped_file, name_match=False, sub_match=False, auth_match=False):
     '''Search for document class related lines in a file  and return a code to represent the type'''
     doc_class_pat = re.compile(r"^\s*\\document(?:style|class)")
     sub_doc_class = re.compile(r"^\s*\\document(?:style|class).*(?:\{standalone\}|\{subfiles\})")
 
     for line in wrapped_file:
+        if auth_match:
+            # we can miss if there are two or more lines with documentclass
+            # and the first one is not the one that has standalone/subfile
+            if sub_doc_class.search(line):
+                return -99999
+            return 1.5 #main_files[tf] = 1
         if doc_class_pat.search(line):
             if name_match:
                 # we can miss if there are two or more lines with documentclass
                 # and the first one is not the one that has standalone/subfile
                 if sub_doc_class.search(line):
                     return -99999
-                return 1 #main_files[tf] = 1
+                return 1.0 #main_files[tf] = 1
             if sub_match:
                 if sub_doc_class.search(line):
                     return -99999
@@ -145,6 +123,7 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
     Args:
         tar_path: A gzipped tar archive of a directory containing tex source and support files.
     '''
+    auth_tex_names = set(["authlist",])
     main_tex_names = set(["paper", "main", "ms.", "article", "manuscript", "neurips"])
     sub_tex_names = set(["appendix", "supplementary", "template"])
 
@@ -166,18 +145,45 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
         main_files = {}
         for tf in tex_files:
             depth = len(tf.split('/')) - 1
+            has_auth_name = any(kw in tf for kw in auth_tex_names)
             has_main_name = any(kw in tf for kw in main_tex_names)
             has_sub_name = any(kw in tf for kw in sub_tex_names)
-            fp = in_tar.extractfile(tf)
-            wrapped_file = io.TextIOWrapper(fp, newline=None, encoding=encoding) #universal newlines
-            # does it have a doc class?
-            # get the type
-            main_files[tf] = find_doc_class(
-                wrapped_file,
-                name_match=has_main_name,
-                sub_match=has_sub_name,
-                ) - depth
-            wrapped_file.close()
+            try:
+                fp = in_tar.extractfile(tf)
+                wrapped_file = io.TextIOWrapper(fp, newline=None, encoding='utf-8') #universal newlines
+                # does it have a doc class?
+                # get the type
+                main_files[tf] = find_doc_class(
+                    wrapped_file,
+                    name_match=has_main_name,
+                    sub_match=has_sub_name,
+                    auth_match=has_auth_name,
+                    ) - depth
+                wrapped_file.close()    
+            except UnicodeDecodeError:
+                try:
+                    raw_data = in_tar.extractfile(tf).peek(10000)
+                    result = chardet.detect(raw_data)
+                    detected_encoding = result["encoding"]
+                    fp = in_tar.extractfile(tf)
+                    wrapped_file = io.TextIOWrapper(
+                        fp, 
+                        newline=None, 
+                        encoding=detected_encoding, 
+                        errors="replace"
+                    ) #universal newlines
+                    main_files[tf] = find_doc_class(
+                        wrapped_file,
+                        name_match=has_main_name,
+                        sub_match=has_sub_name,
+                    ) - depth
+                    wrapped_file.close() 
+                except Exception as e:
+                    print(
+                        f"Failed to read {tar_path}-{tf} with"
+                        f" detected encoding {detected_encoding}: {e}"
+                    )
+                    raise e
 
         # return all if asked
         if all_found and with_weights:
@@ -270,6 +276,7 @@ def extract_pre_abstract_content(tar_path, tex_main):
     """
     Parses a .tex file:
     - Removes LaTeX comments
+    - Extracts using latex macros
     - Extracts institution names (via recursive regex)
     - Extracts text before the abstract
     """
@@ -331,12 +338,15 @@ def extract_pre_abstract_content(tar_path, tex_main):
     #res_list = []
 
     # try parsing latex:
+    # Note: names are lowered before compare
     auth_macros = set([
         "author", "auth", "authors",
         "institute", "inst", "institution",
-        "affiliation", "affil", "affiliations",
+        "university",
+        "orgname",
+        "affiliation", "affil", "affiliations", "aff",
         "address",
-        "cmsinstitute",
+        "cmsinstitute", "icmlaffiliation",
     ])
     supstr = set([
         "\\textsuperscript",
@@ -347,15 +357,22 @@ def extract_pre_abstract_content(tar_path, tex_main):
         (nodelist, pos, len_) = lxwkr.get_latex_nodes()
         focus_nodes = [
           (i,node) for i,node in enumerate(nodelist)
-          if hasattr(node, "macroname") and node.macroname in auth_macros
+          if hasattr(node, "macroname") and node.macroname.lower() in auth_macros
         ]
         if focus_nodes:
             for i,node in focus_nodes:
                 latex_extracted_institutions.append(node.latex_verbatim())
                 try:
-                    follow_node = nodelist[i+1]
-                    if isinstance(follow_node, LatexGroupNode):
-                        latex_extracted_institutions.append(follow_node.latex_verbatim())
+                    idx_plus = 1
+                    while True:
+                        if idx_plus > 10:
+                            break
+                        follow_node = nodelist[i+idx_plus]
+                        if not isinstance(follow_node, LatexGroupNode):
+                            idx_plus += 1
+                        if isinstance(follow_node, LatexGroupNode):
+                            latex_extracted_institutions.append(follow_node.latex_verbatim())
+                            break
                 except IndexError:
                     pass
             if any(pat in lx for lx in latex_extracted_institutions for pat in supstr):
@@ -369,14 +386,20 @@ def extract_pre_abstract_content(tar_path, tex_main):
             if doc:
                 focus_doc_nodes = [
                   (i,node) for i, node in enumerate(doc[0].nodelist)
-                  if isinstance(node, LatexMacroNode) and node.macroname in auth_macros
+                  if isinstance(node, LatexMacroNode) and node.macroname.lower() in auth_macros
                 ]
                 for i, node in focus_doc_nodes:
                     latex_extracted_institutions.append(node.latex_verbatim())
                     try:
-                        follow_node = doc[0].nodelist[i+1]
-                        if isinstance(follow_node, LatexGroupNode):
-                            latex_extracted_institutions.append(follow_node.latex_verbatim())
+                        idx_plus = 1
+                        while True:
+                            if idx_plus > 10:
+                                break
+                            follow_node = nodelist[i+idx_plus]
+                            if not isinstance(follow_node, LatexGroupNode):
+                                idx_plus += 1
+                            if isinstance(follow_node, LatexGroupNode):
+                                latex_extracted_institutions.append(follow_node.latex_verbatim())
                     except IndexError:
                         pass
                 if any(pat in lx for lx in latex_extracted_institutions for pat in supstr):
@@ -523,10 +546,10 @@ def verify_with_gemini_api(inst_list, source_text, template=None):
     else:
         print("API request failed or empty response")
         return None
-    
+
 ##########################
 # Process one
-##########################
+# #########################
 BAD_IN_PATTERNS = set([
     "Variable not found",
     "Variable, null",
@@ -538,27 +561,48 @@ BAD_START_PATTERNS = set([
     "1. null",  
 ])
 def check_src_list_with_gemini(src_list_gen, verbose=False):
-    res = None
+    '''Check sources in source list until one gives a good result
+    '''
+    gemini_res = None
+    break_outer = False
     for i,src in enumerate(src_list_gen):
-        res = query_gemini_api(src)
+        gemini_res = query_gemini_api(src)
         if verbose:
             print(f"{i}: {src}\n")
-            print(res)
-        if any((res.startswith(pat)) for pat in BAD_START_PATTERNS):
-            res = None
+            print(gemini_res)
+        if gemini_res is None:
             continue
-        if any((pat in res) for pat in BAD_IN_PATTERNS):
-            res = None
-            continue
-        else:
+        for raw_row in gemini_res.strip().splitlines():
+            if raw_row.startswith('`'):
+                # we got a markdown "cell" from gemini
+                continue
+            if any((raw_row.startswith(pat)) for pat in BAD_START_PATTERNS):
+                gemini_res = None
+                break
+            if any((pat in raw_row) for pat in BAD_IN_PATTERNS):
+                gemini_res = None
+                break
+            else:
+                break_outer = True
+                break #from rows
+        if break_outer:
             break # from src_list
-    return res    
+    return gemini_res    
 
 
-def send_one_submission_to_gemini(arx_id, verbose=False):
+def is_good_result(res):
+    if res is None:
+        return False
+    if res.startswith("null"):
+        return False
+    return True
+
+def check_latex_with_gemini(arx_id, verbose=False):
     yymm = arx_id.split(".")[0]
     paper_id = arx_id.split("v")[0]
     tar_path = f"ftp/arxiv/papers/{yymm}/{paper_id}.tar.gz"
+
+    res = None
     if verbose:
         print(f"Processing {tar_path}")
     try:
@@ -566,7 +610,7 @@ def send_one_submission_to_gemini(arx_id, verbose=False):
         for c_file in candidate_files:
             src_list_gen = extract_pre_abstract_content(tar_path, c_file)
             res = check_src_list_with_gemini(src_list_gen, verbose=verbose)
-            if (res is not None) and not (res.startswith("null") or res.startswith("1. null")):
+            if is_good_result(res):
                 return res
     except (FileNotFoundError, ClientError) as e:
         # Probably single file latex or not a latex source paper
@@ -578,12 +622,18 @@ def send_one_submission_to_gemini(arx_id, verbose=False):
     try:
         src_list_gen = extract_pre_abstract_content(gz_path, None)
         res = check_src_list_with_gemini(src_list_gen, verbose=verbose)
-        if (res is not None) and not (res.startswith("null") or res.startswith("1. null")):
+        if is_good_result(res):
             return res
     except (ClientError):
         pass
-    # check text
+    return "null"
+    
+def check_text_with_gemini(arx_id, verbose=False):
+    yymm = arx_id.split(".")[0]
+    paper_id = arx_id.split("v")[0]
     txt_path = f'txt/arxiv/{yymm}/{arx_id}.txt'
+
+    res = None
     if verbose:
         print(f"Processing {txt_path}")
     try:
@@ -597,38 +647,83 @@ def send_one_submission_to_gemini(arx_id, verbose=False):
         # res from trie
         if verbose:
             print(res)
-        if res.startswith("null") or res.startswith("1. null"):
+        if res.startswith("null"):
             res = None
         else:
             break
-    if (res is None) or (res.startswith("1. null")): res = "null"
-
+    if (res is None):
+        res = "null"
     return res
 
 ##########################
 # Threaded processing for multiple files
-##########################
-def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False):
+# #########################
+def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False, vverbose=False):
     #paper_id = arx_id.split("v")[0]
 
     # Phase 1 - get names from text + Phase 2
-    gemini_res = send_one_submission_to_gemini(arx_id, verbose=verbose)
+    gemini_res = []
+    latex_res = check_latex_with_gemini(arx_id, verbose=vverbose)
+    text_res = check_text_with_gemini(arx_id, verbose=vverbose)
+    if latex_res != "null":
+        gemini_res.append(latex_res)
+    if text_res != "null":
+        gemini_res.append(text_res)
+    gemini_res_str = '\n'.join(gemini_res)
     results = []
     found_institutions = False
-    if gemini_res and gemini_res.strip().lower() != "null":
-            for institution in gemini_res.split("\n"):
-                clean_name = institution.split('.', 1)[-1].strip()
+    if gemini_res_str and gemini_res_str.strip().lower() != "null":
+        # get extracted institutions
+        institutions_found = []
+        for raw_row in gemini_res_str.strip().splitlines():
+            if raw_row.startswith('`'):
+                # we got a markdown "cell" from gemini
+                continue
+            if (not raw_row) or (len(raw_row) < 5):
+                continue
+            row = raw_row.strip("[]").strip(',') # we might get a json list instead of line json
+            if row:
+                try:
+                    institutions_found.append(json.loads(row))
+                except json.JSONDecodeError as e:
+                    try:
+                        institutions_found.append(json.loads(r"{}".format(row).replace('\\', '\\\\')))
+                    except json.JSONDecodeError:
+                        if verbose:
+                            print(f"JSONDecodeError: {e} on {arx_id} at {row}")
+                        pass
+        # get ROR
+        for institution in institutions_found:
+            try:
+                clean_name = ""
+                clean_city = ""
+                clean_cntry = ""
+                i_name = institution.get('name',"")
+                i_city = institution.get('city',"")
+                i_cntry = institution.get('country',"")
+                if i_name:
+                    clean_name = i_name.replace('{','').replace('}','').strip()
+                if i_city:
+                    clean_city = i_city.replace('{','').replace('}','').strip()
+                if i_cntry:
+                    clean_cntry = i_cntry.replace('{','').replace('}','').strip()
                 if clean_name:
-                    ror = ROR_FINDER.get_ror(clean_name)
-                    results.append((arx_id, clean_name, ror))
+                    ror = ROR_FINDER.get_ror(
+                        inst_name=clean_name,
+                        inst_city=clean_city,
+                        inst_cntry=clean_cntry,
+                    )
+                    if not ror in [x[3] for x in results]:
+                        results.append((arx_id, clean_name, clean_city, ror))
                     found_institutions = True
+            except Exception as e:
+                if verbose:
+                    print(f"Error: {e} on {arx_id} with {institution}")
+                    print(repr(institution))
+                pass
     if not found_institutions:
-        results.append((arx_id, "null", "null")) 
+        results.append((arx_id, "null", "null", "null")) 
     
-    if lock and pbar:
-        with lock:
-            pbar.update(1)
-
     return results
 
 def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False):
@@ -657,7 +752,7 @@ def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False
                 except Exception as e:
                     if verbose: 
                         print(f"❌ Error processing article '{article}': {e}")
-                    results.append((article, 'error'))
+                    results.append((article, 'error', f"{e}", 'null'))
                     #time.sleep(.5)
                     # try:
                     #     article_results = get_single_file_results(article)
@@ -673,7 +768,7 @@ def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False
                 if not a_id in set(successes)
             ]
             for article in failures:
-                results.append((article, 'error'))
+                results.append((article, 'error', 'timeout', 'null'))
                 if verbose:
                     print(f"❌ Error processing article '{failures}': {e_time}")
 
@@ -682,10 +777,10 @@ def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False
         print(f"✅ Total processing time: {total_time:.2f} seconds")
 
     return results
-    
+
 ############################
-## Phase 2
-#############################
+# # Phase 2
+# ############################
 def load_special_cases_ror():
     docs = []
     ror_sp_gspath = 'gs://institutional-extract-scratch/reference/special_cases.json'
@@ -718,11 +813,13 @@ Answer:
 
 class rorFinder:
     
-    def __init__(self, prompt_template=None):
+    def __init__(self, prompt_template=None, doc_k=5, RECREATE_INDEX=False):
         if prompt_template is None:
             self.prompt_template = ROR_TEMPLATE
         else:
             self.prompt_template = prompt_template
+        self.doc_k = doc_k
+        self.RECREATE_INDEX = RECREATE_INDEX
         self.qa_chain = self.build_qa_chain()
         self.ror_cache = {}
 
@@ -730,8 +827,8 @@ class rorFinder:
         # Load the index model, training it if needed.
         model_project = 'arxiv-development'
         model_bucket_loc = 'institutional-extract-scratch'
-        dest_blob_name = "models/ror_index.zip"
-        local_index = "ror_index"
+        dest_blob_name = "models/ror_index_city_and_noncity_abbrev_county.zip"
+        local_index = "ror_index_city_and_noncity_abbrev_county"
         #os.chdir("/home/jupyter/metadata-vertexai/")
 
 
@@ -740,9 +837,8 @@ class rorFinder:
         client = storage.Client(project=model_project)
         bucket = client.bucket(model_bucket_loc)
         blob = bucket.blob(dest_blob_name)
-        RECREATE_INDEX = False
 
-        if RECREATE_INDEX or (not blob.exists()) :
+        if self.RECREATE_INDEX or (not blob.exists()):
             ror_gspath = 'gs://institutional-extract-scratch/reference/v1.63-2025-04-03-ror-data_schema_v2.json'
             fs = gcsfs.GCSFileSystem()
             with fs.open(ror_gspath, "r", encoding="utf-8") as f:
@@ -751,20 +847,36 @@ class rorFinder:
 
             docs = []
             docs = load_special_cases_ror()
-            for i,entry in enumerate(ror_data):
+            for i,entry in tqdm(enumerate(ror_data)):
                 ror_id = entry.get("id", "")
-                locs = entry.get('locations')
+                if not ror_id:
+                    continue
+                locs = entry.get('locations',[])
                 loc_name = ""
+                ctry_name = ""
                 try:
                     loc_name = f", {locs[0]['geonames_details']['name']}"
                 except KeyError:
                     pass
-                for name_info in entry.get("names", []):
+                try:
+                    ctry_name = f", {locs[0]['geonames_details']['country_name']}"
+                except KeyError:
+                    pass
+                for name_info in entry.get("names", {}):
                     name = name_info.get("value", "")
-                    if name and ror_id:
-                        # format: "name — ROR_id"
+                    if not name:
+                        continue
+                    if ctry_name and 'acronym' in name_info.get("types", []):
+                        content = f"{name}{ctry_name} — {ror_id}"
+                        docs.append(Document(page_content=content))
+                    else: 
+                        no_loc_content = f"{name} — {ror_id}"
+                        docs.append(Document(page_content=no_loc_content))
+                    if loc_name:
                         content = f"{name}{loc_name} — {ror_id}"
                         docs.append(Document(page_content=content))
+                
+
 
             print(f"Prepared {len(docs)} vector entries to build FAISS index")
 
@@ -814,7 +926,7 @@ class rorFinder:
         #  Build a Retrieval + QA Chain
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 5}),
+            retriever=vectorstore.as_retriever(search_kwargs={"k": self.doc_k}),
             chain_type="stuff",
             chain_type_kwargs={"prompt": prompt},
             return_source_documents=True
@@ -823,17 +935,26 @@ class rorFinder:
         return qa_chain
 
     #@ft.cache # tends to cache issues too, so we rolled out own
-    def get_ror(self, inst_name):
+    def get_ror(self, inst_name, inst_city="", inst_cntry=""):
         cache_lookup = self.ror_cache.get(inst_name)
         if cache_lookup:
             return cache_lookup
         try:
-            response = self.qa_chain.invoke({"query": inst_name})
+            inst_loc = inst_city
+            cap_count = sum(x.isupper() for x in inst_name)
+            if len(inst_name) <= 3:
+                inst_loc = inst_cntry
+            if cap_count/len(inst_name) > .5:
+                inst_loc = inst_cntry
+
+            name_loc = f"{inst_name}, {inst_loc}"
+            if not inst_loc:
+                name_loc = inst_name
+            response = self.qa_chain.invoke({"query": name_loc})
             ror_id = response["result"].strip()
-            if ror_id == 'null':
+            if ror_id == 'null' and inst_loc:
                 #try without city
-                inst_name_sans = ','.join(inst_name.split(',')[:-1])
-                response = self.qa_chain.invoke({"query": inst_name_sans})
+                response = self.qa_chain.invoke({"query": inst_name})
                 ror_id = response["result"].strip()
             if ror_id != 'null':
                 self.ror_cache[inst_name] = ror_id

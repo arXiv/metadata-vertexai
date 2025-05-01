@@ -1,0 +1,21 @@
+2311.15491v1 the institution is on the last page
+2311.13529v2 many institutitions with special characters
+2311.02437v1 not unicode
+
+
+
+
+Not King's College, London (scopus mislabel)
+2311.02036 imperial college
+2311.00071v2 imperial college
+2311.00089v1 imperial college
+2311.00104v2 imperial college
+2311.00130v2 imperial college
+
+
+
+Is King's College
+2311.18298v1 as part of Atlas collab. Download and inspect
+
+
+

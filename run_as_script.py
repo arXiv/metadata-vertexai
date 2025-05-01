@@ -102,7 +102,7 @@ if __name__ == "__main__":
     input_ids = set(ids_2311_all)
     time_code = "2025-04-28"
     save_name = "2311_db"
-    sample_size = "all"
+    sample_size = 100 #"all"
     batch_size = 20
     parallel_workers = 8
     thread_workers = 10
