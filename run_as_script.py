@@ -100,9 +100,9 @@ if __name__ == "__main__":
     tt = TicToc()
 
     input_ids = set(ids_2311_all)
-    time_code = "2025-04-28"
-    save_name = "2311_db"
-    sample_size = 100 #"all"
+    time_code = "2025-05-01"
+    save_name = "2311_db_json"
+    sample_size = "all"
     batch_size = 20
     parallel_workers = 8
     thread_workers = 10

@@ -91,13 +91,25 @@ Only respond with "True" or "False".
 {source_text}\n\n
 """.strip()
 
+def find_included_files(wrapped_file):
+    '''Search for inclusion macros'''
+    include_pat = re.compile(r'\\(?:input|include|subfile)\s*(?:\[.+\])?\s*\{([^}]+)\}')
+    matches = include_pat.findall(wrapped_file.read())
+    if not matches:
+        return []
+    matches = [x.lstrip('./') for x in matches]
+    matches = [
+        x if x.endswith('.tex') else f"{x}.tex" 
+        for x in matches
+    ]
+    return matches
 
 def find_doc_class(wrapped_file, name_match=False, sub_match=False, auth_match=False):
     '''Search for document class related lines in a file  and return a code to represent the type'''
     doc_class_pat = re.compile(r"^\s*\\document(?:style|class)")
     sub_doc_class = re.compile(r"^\s*\\document(?:style|class).*(?:\{standalone\}|\{subfiles\})")
 
-    for line in wrapped_file:
+    for line in wrapped_file.readlines():
         if auth_match:
             # we can miss if there are two or more lines with documentclass
             # and the first one is not the one that has standalone/subfile
@@ -123,7 +135,7 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
     Args:
         tar_path: A gzipped tar archive of a directory containing tex source and support files.
     '''
-    auth_tex_names = set(["authlist",])
+    #auth_tex_names = set(["authlist", "author"])
     main_tex_names = set(["paper", "main", "ms.", "article", "manuscript", "neurips"])
     sub_tex_names = set(["appendix", "supplementary", "template"])
 
@@ -138,16 +150,17 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
         # got one file
         if len(tex_files) == 1:
             if with_weights:
-                return [(tex_files[0], 1),]
+                return ([(tex_files[0], 1),], None)
             else:
-                return [tex_files[0],]
+                return ([tex_files[0],], None)
 
         main_files = {}
+        included_files = {}
         for tf in tex_files:
             depth = len(tf.split('/')) - 1
-            has_auth_name = any(kw in tf for kw in auth_tex_names)
-            has_main_name = any(kw in tf for kw in main_tex_names)
-            has_sub_name = any(kw in tf for kw in sub_tex_names)
+            has_auth_name = False #any(kw in tf.lower() for kw in auth_tex_names)
+            has_main_name = any(kw in tf.lower() for kw in main_tex_names)
+            has_sub_name = any(kw in tf.lower() for kw in sub_tex_names)
             try:
                 fp = in_tar.extractfile(tf)
                 wrapped_file = io.TextIOWrapper(fp, newline=None, encoding='utf-8') #universal newlines
@@ -158,11 +171,16 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
                     name_match=has_main_name,
                     sub_match=has_sub_name,
                     auth_match=has_auth_name,
-                    ) - depth
-                wrapped_file.close()    
+                ) - depth
+                wrapped_file.close()
+                # need a fresh fp for detection included files
+                fp = in_tar.extractfile(tf)
+                wrapped_file = io.TextIOWrapper(fp, newline=None, encoding='utf-8') #universal newlines
+                included_files[tf] = [x for x in find_included_files(wrapped_file) if x in tex_files]
+                wrapped_file.close() 
             except UnicodeDecodeError:
                 try:
-                    raw_data = in_tar.extractfile(tf).peek(10000)
+                    raw_data = in_tar.extractfile(tf).peek(50000)
                     result = chardet.detect(raw_data)
                     detected_encoding = result["encoding"]
                     fp = in_tar.extractfile(tf)
@@ -177,6 +195,11 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
                         name_match=has_main_name,
                         sub_match=has_sub_name,
                     ) - depth
+                    wrapped_file.close()
+                    # need a fresh fp for detection included files
+                    fp = in_tar.extractfile(tf)
+                    wrapped_file = io.TextIOWrapper(fp, newline=None, encoding=detected_encoding, errors='replace') #universal newlines
+                    included_files[tf] = [x for x in find_included_files(wrapped_file) if x in tex_files]
                     wrapped_file.close() 
                 except Exception as e:
                     print(
@@ -187,16 +210,28 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
 
         # return all if asked
         if all_found and with_weights:
-            return sorted(main_files.items(), key=lambda x: x[1], reverse=True)
+            return (
+                sorted(main_files.items(), key=lambda x: x[1], reverse=True),
+                included_files
+            )
         if all_found:
-            return sorted(main_files, key=main_files.get, reverse=True)
+            return (
+                sorted(main_files, key=main_files.get, reverse=True),
+                included_files
+            )
 
         # got one file with doc class
         if len(main_files) == 1:
-            return(main_files.keys()[0])
+            return (
+                [main_files.keys()[0],],
+                included_files
+            )
 
         # account for multi-file submissions
-        return(max(main_files, key=main_files.get))
+        return (
+            [max(main_files, key=main_files.get)],
+            included_files
+        )
 
 def pre_format(text):
     '''Apply some substititions to make LaTeX easier to parse'''
@@ -271,8 +306,24 @@ def extract_texsuperscript(latex_node_list, res=None):
         if sublist:
             extract_texsuperscript(sublist, res)
     return res
-    
-def extract_pre_abstract_content(tar_path, tex_main):
+
+def append_node_contents(focus_nodes, full_nodelist, result_list):
+    for i,node in focus_nodes:
+        result_list.append(node.latex_verbatim())
+        try:
+            idx_plus = 1
+            while True:
+                if idx_plus > 10:
+                    break
+                follow_node = full_nodelist[i+idx_plus]
+                if isinstance(follow_node, LatexGroupNode):
+                    result_list.append(follow_node.latex_verbatim())
+                    break
+                idx_plus += 1
+        except IndexError:
+            pass
+
+def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
     """
     Parses a .tex file:
     - Removes LaTeX comments
@@ -280,6 +331,13 @@ def extract_pre_abstract_content(tar_path, tex_main):
     - Extracts institution names (via recursive regex)
     - Extracts text before the abstract
     """
+    auth_tex_names = set(["authlist", "author", "affil"])
+    
+    incl_res_gen_list = []
+    if include_list:
+        for inc_file in include_list:
+            incl_res_gen_list.append(extract_pre_abstract_content(tar_path, inc_file))
+        
     client = storage.Client(project=PRD_PROJECT)
     bucket = client.bucket(PRD_BUCKET_LOC)
     blob = bucket.blob(tar_path)
@@ -352,29 +410,20 @@ def extract_pre_abstract_content(tar_path, tex_main):
         "\\textsuperscript",
     ])
     latex_extracted_institutions = []
+    for inc_gen in incl_res_gen_list:
+        latex_extracted_institutions.append(next(inc_gen))
+    
     try:
         lxwkr = LatexWalker(content)
         (nodelist, pos, len_) = lxwkr.get_latex_nodes()
         focus_nodes = [
           (i,node) for i,node in enumerate(nodelist)
-          if hasattr(node, "macroname") and node.macroname.lower() in auth_macros
+          if isinstance(node, LatexMacroNode) and node.macroname.lower() in auth_macros
         ]
         if focus_nodes:
-            for i,node in focus_nodes:
-                latex_extracted_institutions.append(node.latex_verbatim())
-                try:
-                    idx_plus = 1
-                    while True:
-                        if idx_plus > 10:
-                            break
-                        follow_node = nodelist[i+idx_plus]
-                        if not isinstance(follow_node, LatexGroupNode):
-                            idx_plus += 1
-                        if isinstance(follow_node, LatexGroupNode):
-                            latex_extracted_institutions.append(follow_node.latex_verbatim())
-                            break
-                except IndexError:
-                    pass
+            append_node_contents(focus_nodes, nodelist, latex_extracted_institutions)
+            # Get /textsuperscript contents if indicated
+            # @todo: also get the $^[1]$Institution style indicators 
             if any(pat in lx for lx in latex_extracted_institutions for pat in supstr):
                 sup_res = extract_texsuperscript(nodelist)
                 latex_extracted_institutions.extend(sup_res)
@@ -384,26 +433,16 @@ def extract_pre_abstract_content(tar_path, tex_main):
                 if isinstance(node, LatexEnvironmentNode) and node.environmentname=='document'
             ]
             if doc:
+                docnodelist = doc[0].nodelist
                 focus_doc_nodes = [
-                  (i,node) for i, node in enumerate(doc[0].nodelist)
+                  (i,node) for i, node in enumerate(docnodelist)
                   if isinstance(node, LatexMacroNode) and node.macroname.lower() in auth_macros
                 ]
-                for i, node in focus_doc_nodes:
-                    latex_extracted_institutions.append(node.latex_verbatim())
-                    try:
-                        idx_plus = 1
-                        while True:
-                            if idx_plus > 10:
-                                break
-                            follow_node = nodelist[i+idx_plus]
-                            if not isinstance(follow_node, LatexGroupNode):
-                                idx_plus += 1
-                            if isinstance(follow_node, LatexGroupNode):
-                                latex_extracted_institutions.append(follow_node.latex_verbatim())
-                    except IndexError:
-                        pass
+                append_node_contents(focus_doc_nodes, docnodelist, latex_extracted_institutions)
+                # Get /textsuperscript contents if indicated
+                # @todo: also get the $^[1]$Institution style indicators 
                 if any(pat in lx for lx in latex_extracted_institutions for pat in supstr):
-                    sup_res = extract_texsuperscript(doc[0].nodelist)
+                    sup_res = extract_texsuperscript(docnodelist)
                     latex_extracted_institutions.extend(sup_res)
         if latex_extracted_institutions:
             #res_list.append(latex_extracted_institutions)
@@ -420,16 +459,19 @@ def extract_pre_abstract_content(tar_path, tex_main):
     # until the outermost braces are matched.
     # If your LaTeX does not have deep nesting, this mainly ensures things like $^{1}$ are correctly parsed.
     institution_patterns = [
-        r"\\affiliation\s*(:?\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
-        r"\\institute\s*(:?\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
-        r"\\address\s*(:?\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
-        r"\\inst\s*(:?\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
-        r"\\affil\s*(:?\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
-        r"\\author\s*(:?\[\d+\])?\s*{[^}]+}{([^}]+)}",
-        r"\\cmsinstitute\s*(:?\[\d+\])?\s*{[^}]+}{([^}]+)}",
+        r"\\affiliation\s*(?:\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
+        r"\\institute\s*(?:\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
+        r"\\address\s*(?:\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
+        r"\\inst\s*(?:\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
+        r"\\affil\s*(?:\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
+        r"\\author\s*(?:\[\d+\])?\s*{[^}]+}{([^}]+)}",
+        r"\\cmsinstitute\s*(?:\[\d+\])?\s*{[^}]+}{([^}]+)}",
     ]
 
     extracted_institutions = []
+    for inc_gen in incl_res_gen_list:
+        extracted_institutions.append(next(inc_gen))
+    
     for pattern in institution_patterns:
         # Use regex.findall with DOTALL to allow '.' to match newlines
         matches = re.findall(pattern, content, flags=re.DOTALL)
@@ -449,6 +491,10 @@ def extract_pre_abstract_content(tar_path, tex_main):
         yield "\n".join(set(extracted_institutions))
 
     # If no institution found, try extracting the text before the abstract
+    text_extract_list = []
+    for inc_gen in incl_res_gen_list:
+        text_extract_list.append(next(inc_gen))
+    
     match = re.split(
         r"\\begin\s*{\s*abstract\s*}|\\s*\\section\s*{\s*Abstract\s*}",
         content,
@@ -456,23 +502,36 @@ def extract_pre_abstract_content(tar_path, tex_main):
         flags=re.IGNORECASE
     )
     if len(match) > 1:
+        text_extract_list.append(match[0].strip())
         #return match[0].strip()
         #res_list.append(match[0].strip())
-        yield match[0].strip()
+        yield "\n".join(text_extract_list)
+
 
     # If still not found, return the first 1/3 of the content as a fallback
+    content_extract_list = []
+    for inc_gen in incl_res_gen_list:
+        content_extract_list.append(next(inc_gen))
+    
     content_length = len(content)
     if content_length > 0:
-        one_third_length = max(content_length//3, 2000)
-        #return content[:one_third_length].strip()
-        #res_list.append(content[:one_third_length].strip())
-        yield content[:one_third_length].strip()
+        if any(p in tex_main for p in auth_tex_names):
+            content_extract_list.append(content.strip())
+        else:
+            one_third_length = max(content_length//3, 2000)
+            #return content[:one_third_length].strip()
+            #res_list.append(content[:one_third_length].strip())
+            content_extract_list.append(content[:one_third_length].strip())
+    if content_extract_list:
+        yield "\n".join(content_extract_list)
 
     # If still not found, return an empty string
     #if res_list:
     #  yield res_list
     #else:
     # yield ["",]
+    for inc_gen in incl_res_gen_list:
+        del inc_gen
     return None
 
 
@@ -563,10 +622,23 @@ BAD_START_PATTERNS = set([
 def check_src_list_with_gemini(src_list_gen, verbose=False):
     '''Check sources in source list until one gives a good result
     '''
+    width = 20000
+    overlap = 500
+    
     gemini_res = None
     break_outer = False
     for i,src in enumerate(src_list_gen):
-        gemini_res = query_gemini_api(src)
+        if len(src) < 30000:
+            gemini_res = query_gemini_api(src)
+        else:
+            # overlapping windows:
+            composite_res = []
+            rng_srt = range(0,     len(src), width-overlap)
+            rng_stp = range(width, len(src), width-overlap)
+            for i, j in itr.zip_longest(rng_srt, rng_stp):
+                composite_res.append(query_gemini_api(src[i:j]))
+                if j is None: break
+            gemini_res = '\n'.join(composite_res)
         if verbose:
             print(f"{i}: {src}\n")
             print(gemini_res)
@@ -606,9 +678,12 @@ def check_latex_with_gemini(arx_id, verbose=False):
     if verbose:
         print(f"Processing {tar_path}")
     try:
-        candidate_files = find_main_tex_source_in_tar(tar_path, all_found=True)
+        candidate_files, include_dict = find_main_tex_source_in_tar(tar_path, all_found=True)
         for c_file in candidate_files:
-            src_list_gen = extract_pre_abstract_content(tar_path, c_file)
+            if verbose:
+                print(f"\tProcessing {tar_path}, {c_file}")
+            inc_list = include_dict.get(c_file, None) if isinstance(include_dict, dict) else None
+            src_list_gen = extract_pre_abstract_content(tar_path, c_file, inc_list)
             res = check_src_list_with_gemini(src_list_gen, verbose=verbose)
             if is_good_result(res):
                 return res
@@ -820,17 +895,63 @@ class rorFinder:
             self.prompt_template = prompt_template
         self.doc_k = doc_k
         self.RECREATE_INDEX = RECREATE_INDEX
-        self.qa_chain = self.build_qa_chain()
         self.ror_cache = {}
+        self.ror_gspath = 'gs://institutional-extract-scratch/reference/v1.63-2025-04-03-ror-data_schema_v2.json'
+        self.model_project = 'arxiv-development'
+        self.model_bucket_loc = 'institutional-extract-scratch'
+        self.dest_blob_name = "models/ror_index_city_and_noncity_abbrev_county_withdrawn.zip"
+        self.local_index = "ror_index_city_and_noncity_abbrev_county_withdrawn"
+        self.withdrawn_map = self.build_withdrawn_map()
+        self.qa_chain = self.build_qa_chain()
+        
+        
+    def build_withdrawn_map(self):
+        fs = gcsfs.GCSFileSystem()
+        with fs.open(self.ror_gspath, "r", encoding="utf-8") as f:
+            ror_data = json.load(f)
+
+        #Locate withdrawn and successors
+        ror_dict = {e['id']:e for e in ror_data}
+        wd_succ_dict = {}
+        inactive_set = set([
+            'withdrawn',
+            'inactive',
+        ])
+        withdrawn_ror = {
+            e['id']: e['id']
+            for e in ror_data 
+            if e.get('status',"") in inactive_set
+        }
+        max_follows = 10
+        follow_count = 0
+        while len(withdrawn_ror) > 0:
+            if follow_count > max_follows:
+                break
+            for wd_ror, sc_ror in tqdm(withdrawn_ror.items()):
+                wd_entity = ror_dict[sc_ror]
+                successor_rel = [
+                    r['id'] for r in wd_entity.get('relationships',[])
+                    if r['type'] == 'successor'
+                ]
+                if len(successor_rel) < 1:
+                    continue
+                succ_ror = successor_rel[0]
+                wd_succ_dict[wd_ror] = succ_ror
+            withdrawn_ror = {
+                wd_ror: sc_ror 
+                for wd_ror, sc_ror in wd_succ_dict.items()
+                if sc_ror in withdrawn_ror.keys()
+            }
+            follow_count += 1
+        return wd_succ_dict
 
     def build_qa_chain(self):
         # Load the index model, training it if needed.
-        model_project = 'arxiv-development'
-        model_bucket_loc = 'institutional-extract-scratch'
-        dest_blob_name = "models/ror_index_city_and_noncity_abbrev_county.zip"
-        local_index = "ror_index_city_and_noncity_abbrev_county"
+        model_project    = self.model_project   
+        model_bucket_loc = self.model_bucket_loc
+        dest_blob_name   = self.dest_blob_name  
+        local_index      = self.local_index     
         #os.chdir("/home/jupyter/metadata-vertexai/")
-
 
         embedding = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
@@ -839,18 +960,23 @@ class rorFinder:
         blob = bucket.blob(dest_blob_name)
 
         if self.RECREATE_INDEX or (not blob.exists()):
-            ror_gspath = 'gs://institutional-extract-scratch/reference/v1.63-2025-04-03-ror-data_schema_v2.json'
             fs = gcsfs.GCSFileSystem()
-            with fs.open(ror_gspath, "r", encoding="utf-8") as f:
+            with fs.open(self.ror_gspath, "r", encoding="utf-8") as f:
                 ror_data = json.load(f)
-
-
+                
+            #Locate withdrawn and successors
+            wd_succ_dict = self.withdrawn_map
+                
+            #Parse into training docs
             docs = []
             docs = load_special_cases_ror()
             for i,entry in tqdm(enumerate(ror_data)):
                 ror_id = entry.get("id", "")
                 if not ror_id:
                     continue
+                # Check if withdrawn and link to active successor
+                ror_id = wd_succ_dict.get(ror_id, ror_id)
+                
                 locs = entry.get('locations',[])
                 loc_name = ""
                 ctry_name = ""
@@ -876,8 +1002,6 @@ class rorFinder:
                         content = f"{name}{loc_name} — {ror_id}"
                         docs.append(Document(page_content=content))
                 
-
-
             print(f"Prepared {len(docs)} vector entries to build FAISS index")
 
             # Embedding model (recommended: MiniLM)
