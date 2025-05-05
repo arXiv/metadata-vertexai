@@ -14,6 +14,7 @@ from pytictoc import TicToc
 
 import pandas as pd
 import numpy as np
+import gc
 
 import gcsfs
 fs = gcsfs.GCSFileSystem()
@@ -46,7 +47,7 @@ from pylatexenc.latex2text import LatexNodes2Text
 
 os.chdir("/home/jupyter/metadata-vertexai/")  # this needs to be the folder where notebook lives
 import importlib
-import phase_one
+import phase_one_json as phase_one
 
 
 def worker(arx_id_list):
@@ -58,7 +59,7 @@ def run_phase_one_in_parallel(arx_id_batches, checkpoint_fp=None):
     total_len = sum(len(x) for x in arx_id_batches)
     with concurrent.futures.ProcessPoolExecutor(max_workers=parallel_workers) as executor:
         futures = [executor.submit(worker, arx_id_list) for arx_id_list in arx_id_batches]
-        for future in tqdm(as_completed(futures), total=len(futures)):
+        for future in tqdm(as_completed(futures), total=len(futures), ncols=100, desc='MP batch progress'):
             res = future.result()
             res_list.extend(res)
             if checkpoint_fp is not None:
@@ -92,7 +93,9 @@ def format_results(arxid_inst_ror_list):
 
 if __name__ == "__main__":
 
-    test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2311_ids.csv")
+    # test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2311_ids.csv")
+    test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2023_all_ids.csv")
+    
     #test_ids_df.head()
     ids_2311_all = test_ids_df["arx_id"].unique()
     
@@ -100,16 +103,16 @@ if __name__ == "__main__":
     tt = TicToc()
 
     input_ids = set(ids_2311_all)
-    time_code = "2025-05-01"
-    save_name = "2311_db_json"
+    time_code = "2025-05-03"
+    save_name = "2023_db_json"
     sample_size = "all"
     batch_size = 20
-    parallel_workers = 8
+    parallel_workers = 8 #28 #8
     thread_workers = 10
 
     try:
         objects = []
-        with open(f"checkpoints/{save_name}_{sample_size}.pkl", 'rb') as cp_fp:
+        with open(f"checkpoints/{save_name}_{sample_size}_{time_code}.pkl", 'rb') as cp_fp:
             while True:
                 try:
                     obj = pickle.load(cp_fp)
@@ -120,13 +123,14 @@ if __name__ == "__main__":
         pass
     
     known_ids = []
-    known_res = []
+    known_res_set = set()
     for obj in objects:
         known_ids.extend(x[0] for x in obj)
-        known_res.extend(obj)
+        known_res_set.update(obj)
         
     known_ids = set(known_ids)
     input_ids = input_ids - known_ids
+    known_res = list(known_res_set)
     print(f"Found checkpoints for {len(known_ids)} nodes.")
 
     if sample_size != "all":
@@ -139,12 +143,16 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false" 
 
     batches = np.array_split(list(input_ids), len(input_ids)//batch_size)
+    mp_batches = np.array_split(batches, math.ceil(len(batches)/1024))
     tt.tic()
     print(f"Start: {len(input_ids)} in {len(batches)} batches")
     with open(f"checkpoints/{save_name}_{sample_size}_{time_code}.pkl", 'ab') as cp_fp:
-        res = run_phase_one_in_parallel(batches, cp_fp)
+        for mp_batch in tqdm(mp_batches, desc="MP cycles", ncols=100):
+            res = run_phase_one_in_parallel(mp_batch, cp_fp)
+            known_res.extend(res)
+            del res
+            gc.collect()
     tt.toc()
-    known_res.extend(res)
     res_df = pd.DataFrame.from_records(known_res, columns=['arx_id', 'name', 'ror'])
     res_df.to_csv(f"gs://institutional-extract-scratch/output/{save_name}_{sample_size}_{time_code}.csv.zip", index=False)
     # manually remove pickle file

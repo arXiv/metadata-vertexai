@@ -109,7 +109,7 @@ def find_doc_class(wrapped_file, name_match=False, sub_match=False, auth_match=F
     doc_class_pat = re.compile(r"^\s*\\document(?:style|class)")
     sub_doc_class = re.compile(r"^\s*\\document(?:style|class).*(?:\{standalone\}|\{subfiles\})")
 
-    for line in wrapped_file.readlines():
+    for line in wrapped_file:
         if auth_match:
             # we can miss if there are two or more lines with documentclass
             # and the first one is not the one that has standalone/subfile
@@ -180,9 +180,11 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
                 wrapped_file.close() 
             except UnicodeDecodeError:
                 try:
-                    raw_data = in_tar.extractfile(tf).peek(50000)
+                    raw_data = in_tar.extractfile(tf).read() #peek(50000)
                     result = chardet.detect(raw_data)
                     detected_encoding = result["encoding"]
+                    del raw_data
+                    del result
                     fp = in_tar.extractfile(tf)
                     wrapped_file = io.TextIOWrapper(
                         fp, 
@@ -196,18 +198,23 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
                         sub_match=has_sub_name,
                     ) - depth
                     wrapped_file.close()
+                    del fp
                     # need a fresh fp for detection included files
                     fp = in_tar.extractfile(tf)
                     wrapped_file = io.TextIOWrapper(fp, newline=None, encoding=detected_encoding, errors='replace') #universal newlines
                     included_files[tf] = [x for x in find_included_files(wrapped_file) if x in tex_files]
-                    wrapped_file.close() 
+                    wrapped_file.close()
+                    del fp
                 except Exception as e:
                     print(
                         f"Failed to read {tar_path}-{tf} with"
                         f" detected encoding {detected_encoding}: {e}"
                     )
+                    for del_item in ['fp', 'raw_data', 'result']:
+                        if del_item in locals():
+                            del del_item
                     raise e
-
+        del tar_bytes
         # return all if asked
         if all_found and with_weights:
             return (
@@ -256,6 +263,7 @@ def source_from_tar(tar_path, tex_main, encoding='utf-8'):
         fp = in_tar.extractfile(tex_main)
         wrapped_file = io.TextIOWrapper(fp, newline=None, encoding=encoding) #universal newlines
         source_text = pre_format(wrapped_file.read())
+        del tar_bytes
         return source_text
 
 def extract_texsuperscript(latex_node_list, res=None):
@@ -352,7 +360,7 @@ def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
             try:
                 with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_tar:
                     fp = in_tar.extractfile(tex_main)
-                    raw_data = in_tar.extractfile(tex_main).peek(10000)
+                    raw_data = in_tar.extractfile(tex_main).read() #.peek(10000)
                     result = chardet.detect(raw_data)
                     detected_encoding = result["encoding"]
                     wrapped_file = io.TextIOWrapper(
@@ -375,9 +383,11 @@ def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
         except UnicodeDecodeError:
             try:
                 with gzip.open(io.BytesIO(tar_bytes), 'rb') as in_gz:
-                    raw_data = in_gz.peek(10000)
+                    raw_data = in_gz.read() #.peek(10000)
                     result = chardet.detect(raw_data)
                     detected_encoding = result["encoding"]
+                    del raw_data
+                    del result
                 with gzip.open(
                     io.BytesIO(tar_bytes),
                     'rt', 
@@ -389,10 +399,14 @@ def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
                     f"Failed to read {tar_path} with"
                     f" detected encoding {detected_encoding}: {e}"
                 )
+                for del_item in ['fp', 'raw_data', 'result']:
+                    if del_item in locals():
+                        del del_item
                 return None
-
+    del tar_bytes
     # Remove LaTeX comments (lines starting with non-escaped %)
     content = re.sub(r"(?<!\\)%.*", "", source_text)
+    del source_text
     #res_list = []
 
     # try parsing latex:
@@ -448,7 +462,7 @@ def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
             #res_list.append(latex_extracted_institutions)
             yield "\n".join(latex_extracted_institutions)
     except Exception as e:
-        print(f"Overly broad except in extract_pre_abstract_content(): {e}")
+        print(f"Overly broad except in extract_pre_abstract_content(): {e} for {tar_path}-{tex_main}")
         pass
     
     #  "recursive" regex:
@@ -554,13 +568,15 @@ def extract_select_pages_from_txt(txt_path):
 
     # Split the text by form feed (page break)
     contents = file_contents.split("\u000C")
+    del txt_bytes
+    del file_contents
 
     page_list = [ contents[0:2] ]
     if len(contents) >= 2:
         page_list.append(contents[-2])
     if len(contents) >= 1:
         page_list.append(contents[-1])
-
+    del contents
     return page_list
 
 
@@ -735,7 +751,13 @@ def check_text_with_gemini(arx_id, verbose=False):
 # #########################
 def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False, vverbose=False):
     #paper_id = arx_id.split("v")[0]
-
+    
+    pid = os.getpid()
+    if lock is not None:
+        with lock:
+            with open(f"logs/worker_process_{pid}.log", "a") as infile:
+                infile.write(f"{arx_id} start\n")
+                
     # Phase 1 - get names from text + Phase 2
     gemini_res = []
     latex_res = check_latex_with_gemini(arx_id, verbose=vverbose)
@@ -799,6 +821,11 @@ def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False, vverbos
     if not found_institutions:
         results.append((arx_id, "null", "null", "null")) 
     
+    if lock is not None:
+        with lock:
+            with open(f"logs/worker_process_{pid}.log", "a") as infile:
+                infile.write(f"{arx_id} stop\n")
+                
     return results
 
 def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False):
@@ -809,19 +836,24 @@ def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False
 
     results = []
     lock = threading.Lock()
+    
+    pid = os.getpid()
+    os.makedirs("logs", exist_ok=True)
+    with open(f"logs/worker_process_{pid}.log", "w") as infile:
+        pass
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
     #, tqdm(total=estimated_tex_files, desc="Processing .tex files") as pbar:
         future_to_article = {
-            executor.submit(get_single_file_results, arx_id, lock=None, pbar=None): str(arx_id)
+            executor.submit(get_single_file_results, arx_id, lock=lock, pbar=None): str(arx_id)
             for arx_id in article_list
         }
         successes = []
         try:
-            for future in as_completed(future_to_article, timeout=120):
+            for future in as_completed(future_to_article, timeout=240):
                 article = future_to_article[future]
                 try:
-                    article_results = future.result(timeout=5)
+                    article_results = future.result()
                     results.extend(article_results)
                     successes.append(article)
                 except Exception as e:
@@ -1058,11 +1090,15 @@ class rorFinder:
 
         return qa_chain
 
+    @ft.lru_cache(maxsize=4000)
+    def qa_chain_invoke(self, inst_str):
+        return self.qa_chain.invoke({"query": inst_str})
+    
     #@ft.cache # tends to cache issues too, so we rolled out own
     def get_ror(self, inst_name, inst_city="", inst_cntry=""):
-        cache_lookup = self.ror_cache.get(inst_name)
-        if cache_lookup:
-            return cache_lookup
+        # cache_lookup = self.ror_cache.get(inst_name)
+        # if cache_lookup:
+        #     return cache_lookup
         try:
             inst_loc = inst_city
             cap_count = sum(x.isupper() for x in inst_name)
@@ -1074,14 +1110,14 @@ class rorFinder:
             name_loc = f"{inst_name}, {inst_loc}"
             if not inst_loc:
                 name_loc = inst_name
-            response = self.qa_chain.invoke({"query": name_loc})
+            response = self.qa_chain_invoke(name_loc)
             ror_id = response["result"].strip()
             if ror_id == 'null' and inst_loc:
-                #try without city
-                response = self.qa_chain.invoke({"query": inst_name})
+                #try without loc
+                response = self.qa_chain_invoke(inst_name)
                 ror_id = response["result"].strip()
-            if ror_id != 'null':
-                self.ror_cache[inst_name] = ror_id
+            #if ror_id != 'null':
+            #    self.ror_cache[inst_name] = ror_id
 
         except Exception as e:
             print(f"Error querying {inst_name}: {e}")
