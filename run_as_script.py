@@ -107,7 +107,7 @@ if __name__ == "__main__":
     save_name = "2023_db_json"
     sample_size = "all"
     batch_size = 20
-    parallel_workers = 8 #28 #8
+    parallel_workers = 6 #28 #8
     thread_workers = 10
 
     try:

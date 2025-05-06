@@ -3,6 +3,7 @@ import zipfile
 import gzip
 import io
 import os
+import gc
 import itertools as itr
 import functools as ft
 import regex as re
@@ -16,6 +17,8 @@ import json
 import gcsfs
 from google.cloud import storage
 from google.cloud.exceptions import ClientError
+from google.resumable_media.common import InvalidResponse
+
 
 from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexGroupNode, LatexMacroNode, LatexCharsNode
 from pylatexenc.latex2text import LatexNodes2Text
@@ -129,20 +132,18 @@ def find_doc_class(wrapped_file, name_match=False, sub_match=False, auth_match=F
                 return 0.5
     return -0.5 if sub_match else 0 #main_files[tf] = 0
 
-def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, with_weights=False):
+
+def find_main_tex_source_in_tar(tar_bytes, encoding='utf-8', all_found=False, with_weights=False, file_path=None):
     '''Identify the main Tex file in a tarfile.
 
     Args:
-        tar_path: A gzipped tar archive of a directory containing tex source and support files.
+        tar_bytes: A bytes from a gzipped file or a tar archive 
+        of a directory containing tex source and support files.
     '''
     #auth_tex_names = set(["authlist", "author"])
     main_tex_names = set(["paper", "main", "ms.", "article", "manuscript", "neurips"])
     sub_tex_names = set(["appendix", "supplementary", "template"])
 
-    client = storage.Client(project=PRD_PROJECT)
-    bucket = client.bucket(PRD_BUCKET_LOC)
-    blob = bucket.blob(tar_path)
-    tar_bytes = blob.download_as_bytes()
     tex_files = []
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_tar:
         tex_files = [f for f in in_tar.getnames() if f.endswith('.tex')]
@@ -207,14 +208,13 @@ def find_main_tex_source_in_tar(tar_path, encoding='utf-8', all_found=False, wit
                     del fp
                 except Exception as e:
                     print(
-                        f"Failed to read {tar_path}-{tf} with"
+                        f"\nFailed to read {file_path}-{tf} with"
                         f" detected encoding {detected_encoding}: {e}"
                     )
                     for del_item in ['fp', 'raw_data', 'result']:
                         if del_item in locals():
-                            del del_item
+                            del locals()[del_item]
                     raise e
-        del tar_bytes
         # return all if asked
         if all_found and with_weights:
             return (
@@ -263,8 +263,8 @@ def source_from_tar(tar_path, tex_main, encoding='utf-8'):
         fp = in_tar.extractfile(tex_main)
         wrapped_file = io.TextIOWrapper(fp, newline=None, encoding=encoding) #universal newlines
         source_text = pre_format(wrapped_file.read())
-        del tar_bytes
-        return source_text
+    del tar_bytes
+    return source_text
 
 def extract_texsuperscript(latex_node_list, res=None):
     '''for each superscript, get the contents of the next LatexCharsNode'''
@@ -331,7 +331,61 @@ def append_node_contents(focus_nodes, full_nodelist, result_list):
         except IndexError:
             pass
 
-def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
+def source_from_archive(tar_bytes, tex_main=None, file_path=None):
+    ''' Get the source from tar or gz bytes copied from GCP.
+        gz is assumed if tex_main is None
+    '''
+    #assert tex_main is not None, "tex_main is not defined"
+    try:
+        if tex_main:
+            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_file:
+                fp = in_file.extractfile(tex_main)
+                wrapped_file = io.TextIOWrapper(fp, newline=None, encoding='utf-8') #universal newlines
+                source_text = wrapped_file.read()
+                del fp
+                del wrapped_file
+        else:
+            with gzip.open(filename=io.BytesIO(tar_bytes), mode='rt') as in_file:
+                source_text = in_file.read()
+
+    except UnicodeDecodeError:
+        for del_item in ['fp', 'wrapped_file']:
+            if del_item in locals(): del locals()[del_item]
+        try:
+            if tex_main:
+                with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_file:
+                    raw_data = in_file.extractfile(tex_main).read()
+            else:
+                with gzip.open(filename=io.BytesIO(tar_bytes), mode='rb') as in_file:
+                    raw_data = in_file.read()
+            result = chardet.detect(raw_data)
+            detected_encoding = result["encoding"]
+            del raw_data
+
+            if tex_main:
+                with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_file:
+                    fp = in_file.extractfile(tex_main)
+                    wrapped_file = io.TextIOWrapper(fp, newline=None, encoding=detected_encoding) #universal newlines
+                    source_text = wrapped_file.read()
+                    del fp
+                    del wrapped_file
+            else:
+                with gzip.open(filename=io.BytesIO(tar_bytes), mode='rt', encoding=detected_encoding) as in_file:
+                    source_text = in_file.read()
+
+        except Exception as e:
+            print(
+                f"Failed to read {file_path}-{tex_main} with"
+                f" detected encoding {detected_encoding}: {e}"
+            )
+            for del_item in ['fp', 'raw_data', 'wrapped_file', 'result']:
+                if del_item in locals(): del locals()[del_item]
+            return None  
+
+    return source_text
+
+        
+def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, file_path=None):
     """
     Parses a .tex file:
     - Removes LaTeX comments
@@ -344,68 +398,25 @@ def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
     incl_res_gen_list = []
     if include_list:
         for inc_file in include_list:
-            incl_res_gen_list.append(extract_pre_abstract_content(tar_path, inc_file))
-        
-    client = storage.Client(project=PRD_PROJECT)
-    bucket = client.bucket(PRD_BUCKET_LOC)
-    blob = bucket.blob(tar_path)
-    tar_bytes = blob.download_as_bytes()
-    if tar_path.endswith(".tar.gz"):
-        try:
-            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_tar:
-                fp = in_tar.extractfile(tex_main)
-                wrapped_file = io.TextIOWrapper(fp, newline=None, encoding='utf-8') #universal newlines
-                source_text = pre_format(wrapped_file.read())
-        except UnicodeDecodeError:
-            try:
-                with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r') as in_tar:
-                    fp = in_tar.extractfile(tex_main)
-                    raw_data = in_tar.extractfile(tex_main).read() #.peek(10000)
-                    result = chardet.detect(raw_data)
-                    detected_encoding = result["encoding"]
-                    wrapped_file = io.TextIOWrapper(
-                        fp, 
-                        newline=None, 
-                        encoding=detected_encoding, 
-                        errors="replace"
-                    ) #universal newlines
-                    source_text = wrapped_file.read()
-            except Exception as e:
-                print(
-                    f"Failed to read {tar_path}-{tex_main} with"
-                    f" detected encoding {detected_encoding}: {e}"
-                )
-                return None
-    else:
-        try:
-            with gzip.open(io.BytesIO(tar_bytes), 'rt', encoding='utf-8') as in_gz:
-                source_text = in_gz.read()
-        except UnicodeDecodeError:
-            try:
-                with gzip.open(io.BytesIO(tar_bytes), 'rb') as in_gz:
-                    raw_data = in_gz.read() #.peek(10000)
-                    result = chardet.detect(raw_data)
-                    detected_encoding = result["encoding"]
-                    del raw_data
-                    del result
-                with gzip.open(
-                    io.BytesIO(tar_bytes),
-                    'rt', 
-                    encoding=detected_encoding
-                ) as in_gz:
-                    source_text = in_gz.read()
-            except Exception as e:
-                print(
-                    f"Failed to read {tar_path} with"
-                    f" detected encoding {detected_encoding}: {e}"
-                )
-                for del_item in ['fp', 'raw_data', 'result']:
-                    if del_item in locals():
-                        del del_item
-                return None
-    del tar_bytes
+            incl_res_gen_list.append(extract_pre_abstract_content(tar_bytes, tex_main=inc_file, file_path=file_path))
+    
+    source_text = source_from_archive(tar_bytes, tex_main, file_path=file_path)
+    if source_text is None:
+        return None
+
     # Remove LaTeX comments (lines starting with non-escaped %)
+    new_def_str = r"""
+    \\(newcommand|def|newcolumntype|renewcommand|providecommand|DeclareMathOperator|DeclareRobustCommand|newenvironment|renewenvironment|DeclareOption|newlength)\s*{[^}]*}\s*{[^}]*}
+    """.strip()
+    strip_env = r"""
+    \\newenvironment\{[^\}]+\}\s*\{\s*((?>[^{}]+|\{(?1)\})*)\}\s*\{\s*((?>[^{}]+|\{(?1)\})*)\}
+    """.strip()
+
+    strip_env_pat  = re.compile(strip_env, re.DOTALL)
+    new_def_pat = re.compile(new_def_str)
     content = re.sub(r"(?<!\\)%.*", "", source_text)
+    content = strip_env_pat.sub("\n", content)
+    content = new_def_pat.sub("\n", content)
     del source_text
     #res_list = []
 
@@ -428,7 +439,7 @@ def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
         latex_extracted_institutions.append(next(inc_gen))
     
     try:
-        lxwkr = LatexWalker(content)
+        lxwkr = LatexWalker(content, tolerant_parsing=True)
         (nodelist, pos, len_) = lxwkr.get_latex_nodes()
         focus_nodes = [
           (i,node) for i,node in enumerate(nodelist)
@@ -458,11 +469,13 @@ def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
                 if any(pat in lx for lx in latex_extracted_institutions for pat in supstr):
                     sup_res = extract_texsuperscript(docnodelist)
                     latex_extracted_institutions.extend(sup_res)
+        for var in ('nodelist', 'pos', 'len_', 'sup_res', 'focus_nodes', 'doc', 'docnodelist', 'focus_doc_nodes'):
+            if var in locals(): del locals()[var]
         if latex_extracted_institutions:
             #res_list.append(latex_extracted_institutions)
             yield "\n".join(latex_extracted_institutions)
     except Exception as e:
-        print(f"Overly broad except in extract_pre_abstract_content(): {e} for {tar_path}-{tex_main}")
+        print(f"\nOverly broad except in extract_pre_abstract_content(): {e} for {file_path}-{tex_main}")
         pass
     
     #  "recursive" regex:
@@ -472,6 +485,9 @@ def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
     # This matches text possibly containing normal characters or nested braces,
     # until the outermost braces are matched.
     # If your LaTeX does not have deep nesting, this mainly ensures things like $^{1}$ are correctly parsed.
+    
+    # Remove LaTeX comments (lines starting with non-escaped %)
+    
     institution_patterns = [
         r"\\affiliation\s*(?:\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
         r"\\institute\s*(?:\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
@@ -544,8 +560,9 @@ def extract_pre_abstract_content(tar_path, tex_main, include_list=None):
     #  yield res_list
     #else:
     # yield ["",]
-    for inc_gen in incl_res_gen_list:
-        del inc_gen
+    for i in range(len(incl_res_gen_list)):
+        del inc_res_gen_list[i]
+    del incl_res_gen_list
     return None
 
 
@@ -597,7 +614,7 @@ def query_gemini_api(input_text):
         # print(f"Execution time: {timecost:.4f} seconds")
         return clean_response
     else:
-        print("API request failed or empty response")
+        print("\nAPI request failed or empty response")
         return None
 
 def verify_with_gemini_api(inst_list, source_text, template=None):
@@ -619,7 +636,7 @@ def verify_with_gemini_api(inst_list, source_text, template=None):
         # print(f"Execution time: {timecost:.4f} seconds")
         return clean_response
     else:
-        print("API request failed or empty response")
+        print("\nAPI request failed or empty response")
         return None
 
 ##########################
@@ -685,6 +702,13 @@ def is_good_result(res):
         return False
     return True
 
+def bytes_from_tarpath(tar_path):
+    client = storage.Client(project=PRD_PROJECT)
+    bucket = client.bucket(PRD_BUCKET_LOC)
+    blob = bucket.blob(tar_path)
+    tar_bytes = blob.download_as_bytes()
+    return tar_bytes
+
 def check_latex_with_gemini(arx_id, verbose=False):
     yymm = arx_id.split(".")[0]
     paper_id = arx_id.split("v")[0]
@@ -694,28 +718,36 @@ def check_latex_with_gemini(arx_id, verbose=False):
     if verbose:
         print(f"Processing {tar_path}")
     try:
-        candidate_files, include_dict = find_main_tex_source_in_tar(tar_path, all_found=True)
+        tar_bytes = bytes_from_tarpath(tar_path)
+        candidate_files, include_dict = find_main_tex_source_in_tar(tar_bytes, all_found=True, file_path=tar_path)
         for c_file in candidate_files:
             if verbose:
                 print(f"\tProcessing {tar_path}, {c_file}")
             inc_list = include_dict.get(c_file, None) if isinstance(include_dict, dict) else None
-            src_list_gen = extract_pre_abstract_content(tar_path, c_file, inc_list)
+            src_list_gen = extract_pre_abstract_content(tar_bytes, tex_main=c_file, include_list=inc_list, file_path=tar_path)
             res = check_src_list_with_gemini(src_list_gen, verbose=verbose)
             if is_good_result(res):
+                del tar_bytes
                 return res
-    except (FileNotFoundError, ClientError) as e:
+    except (FileNotFoundError, ClientError, InvalidResponse) as e:
         # Probably single file latex or not a latex source paper
+        if 'tar_bytes' in locals():
+            del locals()['tar_bytes']
         pass
     ## Is it gz?
     gz_path = f"ftp/arxiv/papers/{yymm}/{paper_id}.gz"
     if verbose:
         print(f"Processing {gz_path}")
     try:
-        src_list_gen = extract_pre_abstract_content(gz_path, None)
+        gz_bytes = bytes_from_tarpath(gz_path)
+        src_list_gen = extract_pre_abstract_content(gz_bytes, tex_main=None, file_path=tar_path)
         res = check_src_list_with_gemini(src_list_gen, verbose=verbose)
+        del gz_bytes
         if is_good_result(res):
             return res
-    except (ClientError):
+    except (ClientError, InvalidResponse):
+        if 'gz_bytes' in locals():
+            del locals()['gz_bytes']
         pass
     return "null"
     
@@ -757,6 +789,7 @@ def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False, vverbos
         with lock:
             with open(f"logs/worker_process_{pid}.log", "a") as infile:
                 infile.write(f"{arx_id} start\n")
+                infile.flush()
                 
     # Phase 1 - get names from text + Phase 2
     gemini_res = []
@@ -858,7 +891,7 @@ def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False
                     successes.append(article)
                 except Exception as e:
                     if verbose: 
-                        print(f"❌ Error processing article '{article}': {e}")
+                        print(f"\n❌ Error processing article '{article}': {e}")
                     results.append((article, 'error', f"{e}", 'null'))
                     #time.sleep(.5)
                     # try:
@@ -877,12 +910,12 @@ def process_tex_files(article_list, max_files=None, max_workers=5, verbose=False
             for article in failures:
                 results.append((article, 'error', 'timeout', 'null'))
                 if verbose:
-                    print(f"❌ Error processing article '{failures}': {e_time}")
+                    print(f"\n❌ Error processing article '{failures}': {e_time}")
 
-    total_time = time.time() - start_time
     if verbose:
+        total_time = time.time() - start_time
         print(f"✅ Total processing time: {total_time:.2f} seconds")
-
+    gc.collect()
     return results
 
 ############################
@@ -933,7 +966,7 @@ class rorFinder:
         self.model_bucket_loc = 'institutional-extract-scratch'
         self.dest_blob_name = "models/ror_index_city_and_noncity_abbrev_county_withdrawn.zip"
         self.local_index = "ror_index_city_and_noncity_abbrev_county_withdrawn"
-        self.withdrawn_map = self.build_withdrawn_map()
+        self.withdrawn_map = None
         self.qa_chain = self.build_qa_chain()
         
         
@@ -997,6 +1030,8 @@ class rorFinder:
                 ror_data = json.load(f)
                 
             #Locate withdrawn and successors
+            if self.withdrawn_map is None:
+                self.withdrawn_map = self.build_withdrawn_map()
             wd_succ_dict = self.withdrawn_map
                 
             #Parse into training docs
@@ -1090,7 +1125,7 @@ class rorFinder:
 
         return qa_chain
 
-    @ft.lru_cache(maxsize=4000)
+    @ft.lru_cache(maxsize=1000)
     def qa_chain_invoke(self, inst_str):
         return self.qa_chain.invoke({"query": inst_str})
     
