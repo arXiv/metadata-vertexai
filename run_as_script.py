@@ -91,10 +91,38 @@ def format_results(arxid_inst_ror_list):
     return res_list
 
 
+skip_ids = '''
+2301.08641v2
+2304.09870v2
+2309.01118v2
+2310.20374v3
+2303.11590v3
+2308.04512v1
+2312.05433v2
+2304.14219v4
+2307.05569v1
+2312.07121v1
+2312.14567v1
+2303.01063v2
+2308.04512v2
+2309.08117v3
+2302.07019v1
+2305.04720v2
+2306.03953v1
+2310.13041v1
+2310.19023v1
+2312.05433v1
+'''.strip().splitlines()
+skip_ids = set(np.array(skip_ids))
+
+
+
+
+
 if __name__ == "__main__":
 
-    # test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2311_ids.csv")
-    test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2023_all_ids.csv")
+    test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2311_ids.csv")
+    #test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2023_all_ids.csv")
     
     #test_ids_df.head()
     ids_2311_all = test_ids_df["arx_id"].unique()
@@ -103,10 +131,11 @@ if __name__ == "__main__":
     tt = TicToc()
 
     input_ids = set(ids_2311_all)
-    time_code = "2025-05-03"
-    save_name = "2023_db_json"
+    time_code = "2025-05-08"
+    save_name = "2311_db_json"
     sample_size = "all"
-    batch_size = 20
+    batch_size = 20      # articles
+    mp_epoch_size = 20480 #batches
     parallel_workers = 6 #28 #8
     thread_workers = 10
 
@@ -133,17 +162,32 @@ if __name__ == "__main__":
     known_res = list(known_res_set)
     print(f"Found checkpoints for {len(known_ids)} nodes.")
 
+    if True:
+        arxid_itr = itr.groupby(sorted(known_res, key=lambda x: x[0]), key=lambda x: x[0])
+        no_result_idx = [arx_id for arx_id, grp in arxid_itr if all(x[1] in ('null', 'error') for x in grp)]
+        rerun_ids = set(no_result_idx)
+        print(f"Found {len(rerun_ids)} error nodes nodes to reprocess.")
+        input_ids = input_ids.union(rerun_ids)
+    
     if sample_size != "all":
         input_ids = input_ids[:sample_size]
+        
+    input_ids = input_ids - skip_ids
 
     #import concurrent.futures
     #import phase_one
 
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false" 
-
-    batches = np.array_split(list(input_ids), len(input_ids)//batch_size)
-    mp_batches = np.array_split(batches, math.ceil(len(batches)/1024))
+    
+    batches = [list(input_ids)]
+    if len(input_ids) > batch_size:
+        batches = np.array_split(list(input_ids), math.ceil(len(input_ids)/batch_size))
+    print(f"Start: {len(input_ids)} in {len(batches)} batches")
+    mp_batches = [batches]
+    if len(batches) > mp_epoch_size:
+        mp_batches = np.array_split(batches, math.ceil(len(batches)/mp_epoch_size))
+    print(f"Start: {len(batches)} batches in {len(mp_batches)} epochs")
     tt.tic()
     print(f"Start: {len(input_ids)} in {len(batches)} batches")
     with open(f"checkpoints/{save_name}_{sample_size}_{time_code}.pkl", 'ab') as cp_fp:
@@ -153,7 +197,7 @@ if __name__ == "__main__":
             del res
             gc.collect()
     tt.toc()
-    res_df = pd.DataFrame.from_records(known_res, columns=['arx_id', 'name', 'ror'])
+    res_df = pd.DataFrame.from_records(known_res, columns=['arx_id', 'name', 'location', 'ror']).drop_duplicates()
     res_df.to_csv(f"gs://institutional-extract-scratch/output/{save_name}_{sample_size}_{time_code}.csv.zip", index=False)
     # manually remove pickle file
     #res_list = format_results(res)

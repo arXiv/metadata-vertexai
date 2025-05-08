@@ -18,6 +18,7 @@ import gcsfs
 from google.cloud import storage
 from google.cloud.exceptions import ClientError
 from google.resumable_media.common import InvalidResponse
+from google.api_core.exceptions import GoogleAPIError, NotFound, Forbidden
 
 
 from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexGroupNode, LatexMacroNode, LatexCharsNode
@@ -118,18 +119,19 @@ def find_doc_class(wrapped_file, name_match=False, sub_match=False, auth_match=F
             # and the first one is not the one that has standalone/subfile
             if sub_doc_class.search(line):
                 return -99999
-            return 1.5 #main_files[tf] = 1
+            return 1.75 #main_files[tf] = 1
         if doc_class_pat.search(line):
             if name_match:
                 # we can miss if there are two or more lines with documentclass
                 # and the first one is not the one that has standalone/subfile
                 if sub_doc_class.search(line):
                     return -99999
-                return 1.0 #main_files[tf] = 1
+                return 1.5 #main_files[tf] = 1
             if sub_match:
                 if sub_doc_class.search(line):
                     return -99999
                 return 0.5
+            return 1.0
     return -0.5 if sub_match else 0 #main_files[tf] = 0
 
 
@@ -315,21 +317,35 @@ def extract_texsuperscript(latex_node_list, res=None):
             extract_texsuperscript(sublist, res)
     return res
 
-def append_node_contents(focus_nodes, full_nodelist, result_list):
+def append_node_contents(focus_nodes, full_nodelist, result_list, max_followers=3):
     for i,node in focus_nodes:
-        result_list.append(node.latex_verbatim())
+        temp_list = []
+        temp_list.append(node.latex_verbatim())
         try:
             idx_plus = 1
+            group_streak=False
+            follow_count = 0
             while True:
                 if idx_plus > 10:
                     break
+                if follow_count > max_followers:
+                    break
+                if (not group_streak) and (len(temp_list) > 2):
+                    break
                 follow_node = full_nodelist[i+idx_plus]
                 if isinstance(follow_node, LatexGroupNode):
-                    result_list.append(follow_node.latex_verbatim())
-                    break
+                    temp_list.append(follow_node.latex_verbatim())
+                    group_streak = True
+                    follow_count += 1
+                elif isinstance(follow_node, LatexCharsNode):
+                    if not str(follow_node.chars).isspace():
+                        group_streak = False
+                else:
+                    group_streak = False
                 idx_plus += 1
         except IndexError:
             pass
+        result_list.append("".join(temp_list))
 
 def source_from_archive(tar_bytes, tex_main=None, file_path=None):
     ''' Get the source from tar or gz bytes copied from GCP.
@@ -385,7 +401,7 @@ def source_from_archive(tar_bytes, tex_main=None, file_path=None):
     return source_text
 
         
-def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, file_path=None):
+def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, file_path=None, yield_sync=False):
     """
     Parses a .tex file:
     - Removes LaTeX comments
@@ -398,28 +414,40 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
     incl_res_gen_list = []
     if include_list:
         for inc_file in include_list:
-            incl_res_gen_list.append(extract_pre_abstract_content(tar_bytes, tex_main=inc_file, file_path=file_path))
+            incl_res_gen_list.append(
+                extract_pre_abstract_content(tar_bytes, tex_main=inc_file, file_path=file_path, yield_sync=True)
+            )
     
     source_text = source_from_archive(tar_bytes, tex_main, file_path=file_path)
     if source_text is None:
         return None
 
-    # Remove LaTeX comments (lines starting with non-escaped %)
-    new_def_str = r"""
-    \\(newcommand|def|newcolumntype|renewcommand|providecommand|DeclareMathOperator|DeclareRobustCommand|newenvironment|renewenvironment|DeclareOption|newlength)\s*{[^}]*}\s*{[^}]*}
+    # Remove LaTeX comments (lines starting with non-escaped %)    
+    new_def_v4 = r"""
+    \\(newcommand|def|newcolumntype|renewcommand|providecommand|DeclareMathOperator|DeclareRobustCommand|newenvironment|renewenvironment|DeclareOption|newlength|newtheorem)\s*\{[^\}]+\}\s*(\[[^\]]*\])*(\s*\{\s*(\s*(?>(\\[{}]|[^{}])+|\{(?3)\})*)+\s*\}){1,3}
     """.strip()
+
+    #old # \\newenvironment\{[^\}]+\}\s*\{\s*((?>[^{}]+|\{(?1)\})*)\}\s*\{\s*((?>[^{}]+|\{(?1)\})*)\}
+    # old \\newenvironment\s*\{[^\}]+\}\s*(\[[^\]]*\])*(\{\s*(\s*(?>[^{}]+|\{(?3)\})*)+\}){1,3}
+
     strip_env = r"""
-    \\newenvironment\{[^\}]+\}\s*\{\s*((?>[^{}]+|\{(?1)\})*)\}\s*\{\s*((?>[^{}]+|\{(?1)\})*)\}
+    \\newenvironment\s*\{[^\}]+\}\s*(\s*\[[^\]]*\])*(\s*\{\s*(\s*(?>(\\\\+|\\[{}]|[^{}\\])+|\{(?3)\})*|\\)+\}){1,3}
     """.strip()
 
-    strip_env_pat  = re.compile(strip_env, re.DOTALL)
-    new_def_pat = re.compile(new_def_str)
-    content = re.sub(r"(?<!\\)%.*", "", source_text)
-    content = strip_env_pat.sub("\n", content)
-    content = new_def_pat.sub("\n", content)
-    del source_text
-    #res_list = []
 
+    strip_provcmd = r"""
+    \\providecommand\{[^\}]+\}\s*(\[[^\]]*\])?\s*\{\s*((?>(\\[{}]|[^{}])+|\{(?:[^{}]*|(?1))\})*)\}
+    """.strip()
+
+    new_def_v4_pat = re.compile(new_def_v4, re.DOTALL)
+    strip_env_pat  = re.compile(strip_env, re.DOTALL)
+    strip_provcmd_pat  = re.compile(strip_provcmd, re.DOTALL)
+
+    content = re.sub(r"(?<!\\)%.*", "", source_text)
+    content = strip_provcmd_pat.sub("\n", content)
+    content = strip_env_pat.sub("\n", content)
+    content = new_def_v4_pat.sub("\n", content)
+    
     # try parsing latex:
     # Note: names are lowered before compare
     auth_macros = set([
@@ -435,8 +463,7 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
         "\\textsuperscript",
     ])
     latex_extracted_institutions = []
-    for inc_gen in incl_res_gen_list:
-        latex_extracted_institutions.append(next(inc_gen))
+
     
     try:
         lxwkr = LatexWalker(content, tolerant_parsing=True)
@@ -471,12 +498,20 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
                     latex_extracted_institutions.extend(sup_res)
         for var in ('nodelist', 'pos', 'len_', 'sup_res', 'focus_nodes', 'doc', 'docnodelist', 'focus_doc_nodes'):
             if var in locals(): del locals()[var]
-        if latex_extracted_institutions:
-            #res_list.append(latex_extracted_institutions)
-            yield "\n".join(latex_extracted_institutions)
+
     except Exception as e:
         print(f"\nOverly broad except in extract_pre_abstract_content(): {e} for {file_path}-{tex_main}")
+        for var in ('nodelist', 'pos', 'len_', 'sup_res', 'focus_nodes', 'doc', 'docnodelist', 'focus_doc_nodes'):
+            if var in locals(): del locals()[var]
         pass
+    
+    for inc_gen in incl_res_gen_list:
+        inc_res = next(inc_gen)
+        if inc_res:
+            latex_extracted_institutions.append(inc_res)
+    if latex_extracted_institutions or yield_sync:
+        #res_list.append(latex_extracted_institutions)
+        yield "\n".join(latex_extracted_institutions)
     
     #  "recursive" regex:
     #   ((?>[^{}]+|\{(?1)\})*)
@@ -496,11 +531,10 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
         r"\\affil\s*(?:\[\d+\])?\s*\{((?>[^{}]+|\{(?1)\})*)\}",
         r"\\author\s*(?:\[\d+\])?\s*{[^}]+}{([^}]+)}",
         r"\\cmsinstitute\s*(?:\[\d+\])?\s*{[^}]+}{([^}]+)}",
+        r"\\icmlaffiliation\s*(?:\[\d+\])?\s*{[^}]+}{([^}]+)}",
     ]
 
     extracted_institutions = []
-    for inc_gen in incl_res_gen_list:
-        extracted_institutions.append(next(inc_gen))
     
     for pattern in institution_patterns:
         # Use regex.findall with DOTALL to allow '.' to match newlines
@@ -514,7 +548,11 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
                     extracted_institutions.extend(m.strip() for m in matches if m.strip())
 
     # If any institution info is extracted, return the deduplicated joined text
-    if extracted_institutions:
+    for inc_gen in incl_res_gen_list:
+        inc_res = next(inc_gen)
+        if inc_res:
+            extracted_institutions.append(inc_res)
+    if extracted_institutions or yield_sync:
         # You can change the join method; here we join by newline and use set to deduplicate
         #return "\n".join(set(extracted_institutions))
         #res_list.append("\n".join(set(extracted_institutions)))
@@ -523,7 +561,9 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
     # If no institution found, try extracting the text before the abstract
     text_extract_list = []
     for inc_gen in incl_res_gen_list:
-        text_extract_list.append(next(inc_gen))
+        inc_res = next(inc_gen)
+        if inc_res:
+            text_extract_list.append(inc_res)
     
     match = re.split(
         r"\\begin\s*{\s*abstract\s*}|\\s*\\section\s*{\s*Abstract\s*}",
@@ -531,28 +571,31 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
         maxsplit=1,
         flags=re.IGNORECASE
     )
-    if len(match) > 1:
+    if (len(match) > 1):
         text_extract_list.append(match[0].strip())
         #return match[0].strip()
         #res_list.append(match[0].strip())
+    if text_extract_list or yield_sync:
         yield "\n".join(text_extract_list)
 
 
     # If still not found, return the first 1/3 of the content as a fallback
     content_extract_list = []
     for inc_gen in incl_res_gen_list:
-        content_extract_list.append(next(inc_gen))
+        inc_res = next(inc_gen)
+        if inc_res:
+            content_extract_list.append(inc_res)
     
     content_length = len(content)
     if content_length > 0:
-        if any(p in tex_main for p in auth_tex_names):
+        if tex_main and any(p in tex_main for p in auth_tex_names):
             content_extract_list.append(content.strip())
         else:
             one_third_length = max(content_length//3, 2000)
             #return content[:one_third_length].strip()
             #res_list.append(content[:one_third_length].strip())
             content_extract_list.append(content[:one_third_length].strip())
-    if content_extract_list:
+    if content_extract_list or yield_sync:
         yield "\n".join(content_extract_list)
 
     # If still not found, return an empty string
@@ -706,8 +749,11 @@ def bytes_from_tarpath(tar_path):
     client = storage.Client(project=PRD_PROJECT)
     bucket = client.bucket(PRD_BUCKET_LOC)
     blob = bucket.blob(tar_path)
-    tar_bytes = blob.download_as_bytes()
-    return tar_bytes
+    try:
+        tar_bytes = blob.download_as_bytes()
+        return tar_bytes
+    except (FileNotFoundError, ClientError, InvalidResponse, GoogleAPIError, NotFound, Forbidden) as e:
+        raise e
 
 def check_latex_with_gemini(arx_id, verbose=False):
     yymm = arx_id.split(".")[0]
@@ -729,7 +775,7 @@ def check_latex_with_gemini(arx_id, verbose=False):
             if is_good_result(res):
                 del tar_bytes
                 return res
-    except (FileNotFoundError, ClientError, InvalidResponse) as e:
+    except (FileNotFoundError, ClientError, InvalidResponse, GoogleAPIError, NotFound, Forbidden) as e:
         # Probably single file latex or not a latex source paper
         if 'tar_bytes' in locals():
             del locals()['tar_bytes']
@@ -745,7 +791,7 @@ def check_latex_with_gemini(arx_id, verbose=False):
         del gz_bytes
         if is_good_result(res):
             return res
-    except (ClientError, InvalidResponse):
+    except (ClientError, InvalidResponse, GoogleAPIError, NotFound, Forbidden):
         if 'gz_bytes' in locals():
             del locals()['gz_bytes']
         pass
@@ -761,7 +807,7 @@ def check_text_with_gemini(arx_id, verbose=False):
         print(f"Processing {txt_path}")
     try:
         src_list = extract_select_pages_from_txt(txt_path)
-    except (FileNotFoundError, ClientError):
+    except (FileNotFoundError, ClientError, GoogleAPIError, NotFound, Forbidden):
         src_list = []
         
     res = None
