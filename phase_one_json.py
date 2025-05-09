@@ -424,14 +424,16 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
 
     # Remove LaTeX comments (lines starting with non-escaped %)    
     new_def_v4 = r"""
-    \\(newcommand|def|newcolumntype|renewcommand|providecommand|DeclareMathOperator|DeclareRobustCommand|newenvironment|renewenvironment|DeclareOption|newlength|newtheorem)\s*\{[^\}]+\}\s*(\[[^\]]*\])*(\s*\{\s*(\s*(?>(\\[{}]|[^{}])+|\{(?3)\})*)+\s*\}){1,3}
+    \\(newcommand|def|newcolumntype|renewcommand|providecommand|DeclareMathOperator|DeclareRobustCommand|newenvironment|renewenvironment|DeclareOption|newlength|newtheorem)\s*\{[^\}]+\}\s*(\[[^\]]*\])*(?P<brgrp>\s*\{\s*(?P<inner>(?>\s+|\\\\+|\\[{}]|[^{}\\]+|\\)+|\{(?P>inner)\}+)+\s*\})+
     """.strip()
 
     #old # \\newenvironment\{[^\}]+\}\s*\{\s*((?>[^{}]+|\{(?1)\})*)\}\s*\{\s*((?>[^{}]+|\{(?1)\})*)\}
     # old \\newenvironment\s*\{[^\}]+\}\s*(\[[^\]]*\])*(\{\s*(\s*(?>[^{}]+|\{(?3)\})*)+\}){1,3}
+    #\\newenvironment\s*\{[^\}]+\}\s*(\s*\[[^\]]*\])*(         \s*\{\s*(      \s*(?>   (\\\\+|\\[{}]|[^{}\\]    )+|\{(?3)      \})*|\\)+\}                ){1,3}
+    #\\newenvironment\s*\{[^\}]+\}\s*(\s*\[[^\]]*\])*(?P<brgrp>\s*\{\s*(?P<inner>(?>\s+|\\\\+|\\[{}]|[^{}\\]+|\\                 )+|\{(?P>inner)\}+)+\s*\}){1,3}
 
     strip_env = r"""
-    \\newenvironment\s*\{[^\}]+\}\s*(\s*\[[^\]]*\])*(\s*\{\s*(\s*(?>(\\\\+|\\[{}]|[^{}\\])+|\{(?3)\})*|\\)+\}){1,3}
+    \\newenvironment\s*\{[^\}]+\}\s*(\s*\[[^\]]*\])*(?P<brgrp>\s*\{\s*(?P<inner>(?>\s+|\\\\+|\\[{}]|[^{}\\]+|\\)+|\{(?P>inner)\}+)+\s*\})+
     """.strip()
 
 
@@ -840,11 +842,13 @@ def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False, vverbos
     # Phase 1 - get names from text + Phase 2
     gemini_res = []
     latex_res = check_latex_with_gemini(arx_id, verbose=vverbose)
-    text_res = check_text_with_gemini(arx_id, verbose=vverbose)
     if latex_res != "null":
         gemini_res.append(latex_res)
-    if text_res != "null":
-        gemini_res.append(text_res)
+    else:
+        text_res = check_text_with_gemini(arx_id, verbose=vverbose)
+        if text_res != "null":
+            gemini_res.append(text_res)
+            
     gemini_res_str = '\n'.join(gemini_res)
     results = []
     found_institutions = False
@@ -1054,6 +1058,7 @@ class rorFinder:
                 if sc_ror in withdrawn_ror.keys()
             }
             follow_count += 1
+        self.withdrawn_map = wd_succ_dict
         return wd_succ_dict
 
     def build_qa_chain(self):

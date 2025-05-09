@@ -113,7 +113,7 @@ skip_ids = '''
 2310.19023v1
 2312.05433v1
 '''.strip().splitlines()
-skip_ids = set(np.array(skip_ids))
+skip_ids = set([]) #set(np.array(skip_ids))
 
 
 
@@ -122,7 +122,20 @@ skip_ids = set(np.array(skip_ids))
 if __name__ == "__main__":
 
     test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2311_ids.csv")
+    time_code = "2025-05-09v2"
+    save_name = "2311_db_json"
+    
     #test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2023_all_ids.csv")
+    #time_code = "2025-05-08"
+    #save_name = "2023_db_json"
+    
+    sample_size = "all"
+    batch_size = 20      # articles
+    mp_epoch_size = 20480 #batches
+    parallel_workers = 28 #8
+    thread_workers = 10
+    
+    
     
     #test_ids_df.head()
     ids_2311_all = test_ids_df["arx_id"].unique()
@@ -131,13 +144,7 @@ if __name__ == "__main__":
     tt = TicToc()
 
     input_ids = set(ids_2311_all)
-    time_code = "2025-05-08"
-    save_name = "2311_db_json"
-    sample_size = "all"
-    batch_size = 20      # articles
-    mp_epoch_size = 20480 #batches
-    parallel_workers = 6 #28 #8
-    thread_workers = 10
+    
 
     try:
         objects = []
