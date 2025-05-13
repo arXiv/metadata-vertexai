@@ -121,17 +121,17 @@ skip_ids = set([]) #set(np.array(skip_ids))
 
 if __name__ == "__main__":
 
-    test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2311_ids.csv")
-    time_code = "2025-05-09v2"
-    save_name = "2311_db_json"
+    #test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2311_ids.csv")
+    #time_code = "2025-05-09v2"
+    #save_name = "2311_db_json"
     
-    #test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2023_all_ids.csv")
-    #time_code = "2025-05-08"
-    #save_name = "2023_db_json"
+    test_ids_df = pd.read_csv("gs://institutional-extract-scratch/reference/arx_ids/2024_all_ids.csv")
+    time_code = "2025-05-12"
+    save_name = "2024_db_json"
     
     sample_size = "all"
     batch_size = 20      # articles
-    mp_epoch_size = 20480 #batches
+    mp_epoch_size = 2048 #batches
     parallel_workers = 28 #8
     thread_workers = 10
     
@@ -143,7 +143,7 @@ if __name__ == "__main__":
 
     tt = TicToc()
 
-    input_ids = set(ids_2311_all)
+    input_ids = set(str(x) for x in ids_2311_all)
     
 
     try:
@@ -161,7 +161,7 @@ if __name__ == "__main__":
     known_ids = []
     known_res_set = set()
     for obj in objects:
-        known_ids.extend(x[0] for x in obj)
+        known_ids.extend(str(x[0]) for x in obj)
         known_res_set.update(obj)
         
     known_ids = set(known_ids)
@@ -171,7 +171,7 @@ if __name__ == "__main__":
 
     if True:
         arxid_itr = itr.groupby(sorted(known_res, key=lambda x: x[0]), key=lambda x: x[0])
-        no_result_idx = [arx_id for arx_id, grp in arxid_itr if all(x[1] in ('null', 'error') for x in grp)]
+        no_result_idx = [str(arx_id) for arx_id, grp in arxid_itr if all(x[1] in ('null', 'error') for x in grp)]
         rerun_ids = set(no_result_idx)
         print(f"Found {len(rerun_ids)} error nodes nodes to reprocess.")
         input_ids = input_ids.union(rerun_ids)
@@ -187,16 +187,24 @@ if __name__ == "__main__":
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false" 
     
-    batches = [list(input_ids)]
+    mp_batch_ids = [list(input_ids)]
+    if len(input_ids)/batch_size > mp_epoch_size:
+        #Split into epochs
+        mp_batch_ids = np.array_split(list(input_ids), math.ceil(len(input_ids)/batch_size/mp_epoch_size))
+    mp_batches = [x for x in mp_batch_ids]
     if len(input_ids) > batch_size:
-        batches = np.array_split(list(input_ids), math.ceil(len(input_ids)/batch_size))
-    print(f"Start: {len(input_ids)} in {len(batches)} batches")
-    mp_batches = [batches]
-    if len(batches) > mp_epoch_size:
-        mp_batches = np.array_split(batches, math.ceil(len(batches)/mp_epoch_size))
-    print(f"Start: {len(batches)} batches in {len(mp_batches)} epochs")
+        mp_batches = [
+            np.array_split(x, math.ceil(len(x)/batch_size)) 
+            if len(x) > batch_size
+            else x 
+            for x in mp_batch_ids
+        ]
+    num_batches = sum(len(x) for x in mp_batches)
+
+    print(f"Start: {num_batches} batches in {len(mp_batches)} epochs")
     tt.tic()
-    print(f"Start: {len(input_ids)} in {len(batches)} batches")
+    print(f"Start: {len(input_ids)} in {num_batches} batches")
+    
     with open(f"checkpoints/{save_name}_{sample_size}_{time_code}.pkl", 'ab') as cp_fp:
         for mp_batch in tqdm(mp_batches, desc="MP cycles", ncols=100):
             res = run_phase_one_in_parallel(mp_batch, cp_fp)

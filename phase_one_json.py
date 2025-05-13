@@ -611,7 +611,7 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
     return None
 
 
-def extract_select_pages_from_txt(txt_path):
+def utf8_from_textpath(txt_path):
     """
     Given the gs bucket path to the plain text file, return the
     first 2 pages, then the second to last, and finally the last page.
@@ -627,13 +627,28 @@ def extract_select_pages_from_txt(txt_path):
     blob = bucket.blob(txt_path)
     txt_bytes = blob.download_as_bytes()
     file_contents = txt_bytes.decode('utf-8')
+    del txt_bytes    
+    return file_contents
+
+
+def extract_select_pages_from_txt(txt_path):
+    """
+    Given the gs bucket path to the plain text file, return the
+    first 2 pages, then the second to last, and finally the last page.
+
+    Args:
+        file_contents (str): The full text content of the paper.
+
+    Returns:
+        list of page contents
+    """
+    file_contents = utf8_from_textpath(txt_path)
 
     # Split the text by form feed (page break)
     contents = file_contents.split("\u000C")
-    del txt_bytes
     del file_contents
 
-    page_list = [ contents[0:2] ]
+    page_list = list(contents[0:2])
     if len(contents) >= 2:
         page_list.append(contents[-2])
     if len(contents) >= 1:
