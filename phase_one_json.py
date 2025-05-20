@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import threading
 
 import time
+import pickle
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
@@ -40,6 +41,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
 
+from trie_extractor import TrieExtractor
 
 PROJECT_ID = "arxiv-development"
 PRD_PROJECT = 'arxiv-production'
@@ -94,6 +96,10 @@ Only respond with "True" or "False".
 {source_text}\n\n
 """.strip()
 
+fs = gcsfs.GCSFileSystem()
+with fs.open("gs://institutional-extract-scratch/models/trie_extractor.pkl", "rb") as f:
+    extractor = pickle.load(f)
+    
 def find_included_files(wrapped_file):
     '''Search for inclusion macros'''
     include_pat = re.compile(r'\\(?:input|include|subfile)\s*(?:\[.+\])?\s*\{([^}]+)\}')
@@ -588,13 +594,29 @@ def extract_select_pages_from_txt(txt_path):
     del txt_bytes
     del file_contents
 
-    page_list = [ contents[0:2] ]
+    page_list = [ contents[0:2]]
     if len(contents) >= 2:
         page_list.append(contents[-2])
     if len(contents) >= 1:
         page_list.append(contents[-1])
     del contents
     return page_list
+
+def download_text_from_gcs(txt_gcs_path: str):
+    """
+    Download a UTF-8 text file from Google Cloud Storage and return its contents.
+
+    Args:
+        txt_gcs_path (str): The object path of the text file in the GCS bucket.
+
+    Returns:
+        str: The full text content decoded from UTF-8.
+    """
+    client = storage.Client(project=PRD_PROJECT)
+    bucket = client.bucket(PRD_BUCKET_LOC)
+    blob = bucket.blob(txt_gcs_path)
+    txt_bytes = blob.download_as_bytes()
+    return txt_bytes.decode('utf-8')
 
 
 def query_gemini_api(input_text):
@@ -750,33 +772,91 @@ def check_latex_with_gemini(arx_id, verbose=False):
             del locals()['gz_bytes']
         pass
     return "null"
-    
+
+
 def check_text_with_gemini(arx_id, verbose=False):
+    """
+    For a given arXiv ID:
+      - run Gemini on selected pages;
+      - fall back to 'null' if no result;
+      - extract affiliations via a trie;
+      - merge both sources into one de-duplicated JSON-lines string.
+    Returns:
+        str: newline-separated JSON objects, e.g.:
+          {"name":"…","city":"…","country":"…"}
+          {"name":"…","city":"…","country":"…"}
+    """
     yymm = arx_id.split(".")[0]
-    paper_id = arx_id.split("v")[0]
     txt_path = f'txt/arxiv/{yymm}/{arx_id}.txt'
 
+    # 1) Run Gemini
     res = None
     if verbose:
         print(f"Processing {txt_path}")
     try:
         src_list = extract_select_pages_from_txt(txt_path)
-    except (FileNotFoundError, ClientError):
+    except (FileNotFoundError, ClientError, GoogleAPIError, NotFound, Forbidden):
         src_list = []
-        
-    res = None
+    # [page1, page 2, pages last-1, page last]
+    # [[page1, page 2, pages last-1, page last], page 1, page 2, page last-1...]
     for src in src_list:
-        res = query_gemini_api(src)
-        # res from trie
+        out = query_gemini_api(src)
         if verbose:
-            print(res)
-        if res.startswith("null"):
-            res = None
-        else:
+            print("Gemini:", out)
+        if not out.startswith("null"):
+            res = out
             break
-    if (res is None):
+    if res is None:
         res = "null"
-    return res
+
+    # 2) Trie extractor
+    trie_txt = download_text_from_gcs(txt_path)
+    trie_result = extractor.extract_affiliations_json(trie_txt)
+    if verbose:
+        print("Trie:", trie_result)
+
+    # 3) Helper to parse JSON-lines
+    def parse_json_lines(s):
+        items = []
+        for line in (s or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return items
+
+    gemini_list = [] if res == "null" else parse_json_lines(res)
+    trie_list   = parse_json_lines(trie_result)
+
+    # 4) Merge by lowercased name
+    merged = {}
+    for item in trie_list + gemini_list:
+        name_key = item.get("name", "").strip().lower()
+        if not name_key:
+            continue
+        if name_key not in merged:
+            merged[name_key] = {
+                "name":    item.get("name","").strip(),
+                "city":    item.get("city","").strip(),
+                "country": item.get("country","").strip()
+            }
+        else:
+            # fill blanks from Gemini if available
+            if not merged[name_key]["city"] and item.get("city"):
+                merged[name_key]["city"] = item["city"].strip()
+            if not merged[name_key]["country"] and item.get("country"):
+                merged[name_key]["country"] = item["country"].strip()
+
+    # 5) Emit JSON-lines string
+    merged_lines = "\n".join(json.dumps(v, ensure_ascii=False) for v in merged.values())
+    if verbose:
+        print("Merged:\n" + merged_lines)
+
+    return merged_lines
+
 
 ##########################
 # Threaded processing for multiple files
@@ -793,8 +873,8 @@ def get_single_file_results(arx_id, lock=None, pbar=None, verbose=False, vverbos
                 
     # Phase 1 - get names from text + Phase 2
     gemini_res = []
-    latex_res = check_latex_with_gemini(arx_id, verbose=vverbose)
-    text_res = check_text_with_gemini(arx_id, verbose=vverbose)
+    latex_res = "null"
+    text_res = check_text_with_gemini(arx_id, verbose=true)
     if latex_res != "null":
         gemini_res.append(latex_res)
     if text_res != "null":
