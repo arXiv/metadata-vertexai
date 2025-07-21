@@ -29,7 +29,7 @@ import threading
 
 import time
 import vertexai
-from vertexai.generative_models import GenerativeModel
+from vertexai.generative_models import GenerativeModel, GenerationConfig
 
 # Phase 2
 from langchain.docstore.document import Document
@@ -47,14 +47,21 @@ PRD_PROJECT = 'arxiv-production'
 PRD_BUCKET_LOC = 'arxiv-production-data' 
 
 vertexai.init(project=PROJECT_ID, location="us-central1")
-model = GenerativeModel("gemini-1.5-flash-002")
+model = GenerativeModel("gemini-2.0-flash-lite")
+GEN_CONFIG =  GenerationConfig(
+    temperature=0.0,  # Lower = more deterministic
+    top_p=0.8,        # Lower = more focused, higher = more diverse
+)
 
-### V6 JSON
+#model = GenerativeModel("gemini-1.5-flash-002") # retired
+
+
+### V7 JSON
 PROMPT_TEMPLATE = """
 TASK: Follow the directions to generate output from the SOURCE_TEXT as descibed in the OUTPUT_FORMAT directions.
 Follow the directions below:
  - Find all potential organizations in the SOURCE_TEXT.
- - Expand abbreviations and acronyms of potential organization names.
+ - Expand abbreviations and acronyms of potential organization names using context for known full forms.
  - When organizations are listed together at an address, treat each organization as a separate entity.
  - When organizations are listed together at an address, expand any acronyms as a separate entity.
  - Identify any locations associated explicity associated with any of the potential organizations.
@@ -62,13 +69,16 @@ Follow the directions below:
  - Ignore any sub-units like departments or colleges.
 
 ### OUTPUT_FORMAT:
- - The output should be valid utf-8 line json
- - Output one json Object per line.
+ - Output each JSON object on a separate line with no blank lines between them.
+ - Replace any LaTeX escape sequences with utf-8 characters.
+ - Use UTF-8 characters instead of Unicode escape sequences (e.g.: replace \u00e9 with é).
+ - Do not add any extra text, explanation or annotation before or after the JSON objects.
  - Do not return a json Array.
- - Replace any latex escape sequences in the output with utf-8 characters
  - double-escape all backslashes
  - Only report the main organizations like universities, universi, commissions, foundations or corporations.
  - Ignore sub-units like department, dipartimento, or college.
+ - Do not include duplicate organizations.
+ - Normalize organizations names to their most common full form.
  - Follow this pseudocode to generate the output:
 ```
     if no organizations are found, then output "null".
@@ -143,7 +153,7 @@ def find_main_tex_source_in_tar(tar_bytes, encoding='utf-8', all_found=False, wi
         of a directory containing tex source and support files.
     '''
     #auth_tex_names = set(["authlist", "author"])
-    main_tex_names = set(["paper", "main", "ms.", "article", "manuscript", "neurips"])
+    main_tex_names = set(["arxiv", "paper", "main", "ms.", "article", "manuscript", "neurips"])
     sub_tex_names = set(["appendix", "supplementary", "template"])
 
     tex_files = []
@@ -210,7 +220,7 @@ def find_main_tex_source_in_tar(tar_bytes, encoding='utf-8', all_found=False, wi
                     del fp
                 except Exception as e:
                     print(
-                        f"\nFailed to read {file_path}-{tf} with"
+                        f"\nfind_main_tex_source_in_tar() failed to read {file_path}-{tf} with"
                         f" detected encoding {detected_encoding}: {e}"
                     )
                     for del_item in ['fp', 'raw_data', 'result']:
@@ -391,7 +401,7 @@ def source_from_archive(tar_bytes, tex_main=None, file_path=None):
 
         except Exception as e:
             print(
-                f"Failed to read {file_path}-{tex_main} with"
+                f"source_from_archive() failed to read {file_path}-{tex_main} with"
                 f" detected encoding {detected_encoding}: {e}"
             )
             for del_item in ['fp', 'raw_data', 'wrapped_file', 'result']:
@@ -605,8 +615,8 @@ def extract_pre_abstract_content(tar_bytes, tex_main=None, include_list=None, fi
     #  yield res_list
     #else:
     # yield ["",]
-    for i in range(len(incl_res_gen_list)):
-        del inc_res_gen_list[i]
+    for i in reversed(range(len(incl_res_gen_list))):
+        del incl_res_gen_list[i]
     del incl_res_gen_list
     return None
 
@@ -657,14 +667,16 @@ def extract_select_pages_from_txt(txt_path):
     return page_list
 
 
-def query_gemini_api(input_text):
+def query_gemini_api(input_text, **kwargs):
     """
     Sends a request to the Gemini API to judge quality of result.
     """
     prompt = PROMPT_TEMPLATE.format(input_text=input_text)
+    if not 'generation_config'in kwargs:
+        kwargs['generation_config'] = GEN_CONFIG
 
     start_time = time.time()
-    response = model.generate_content(prompt)
+    response = model.generate_content(prompt, **kwargs)
     end_time = time.time()
 
     timecost = end_time - start_time

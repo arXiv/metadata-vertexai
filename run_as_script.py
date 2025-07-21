@@ -70,6 +70,7 @@ def run_phase_one_in_parallel(arx_id_batches, checkpoint_fp=None):
     return res_list
 
 def format_results(arxid_inst_ror_list):
+    '''Out of sync with current format and not used'''
     res_list = []
     for key, group in tqdm(itr.groupby(arxid_inst_ror_list, key=lambda x: x[0])):
         ror_inst = []
@@ -112,8 +113,83 @@ skip_ids = '''
 2310.13041v1
 2310.19023v1
 2312.05433v1
+2410.12880v2
+2410.12880v3
+2409.14926v1
+2402.00526v1
+2408.12951v2
+2402.19257v1
+2409.14926v2
+2409.07900v1
+2408.16143v1
+2404.04248v3
+2412.13923v2
+2409.14926v3
+2407.18006v1
+2410.15024v1
+2407.12751v1
+2407.18006v1
+2403.09641v1
+2401.13774v1
+2404.16381v1
+2405.20642v2
+2407.18006v1
+2410.19352v1
+2410.12880v3
+2405.16216v3
+2403.00607v1
+2407.01526v1
+2411.08928v1
+2403.08704v1
+2402.10194v1
+2402.17628v1
+2409.19395v1
+2412.03773v1
+2410.08633v2
+2401.15208v1
+2404.10899v1
+2411.08535v1
+2406.01307v1
+2406.17651v4
+2407.18006v1
+2409.09795v1
+2409.10836v2
+2412.01105v1
+2401.13665v2
+2403.00607v1
+2412.03773v1
+2404.03056v1
+2403.12280v1
+2408.10832v1
+2411.13109v2
+2406.17651v4
+2403.17965v1
+2406.11786v1
+2412.20620v1
+2407.12751v1
+2410.20476v2
+2411.19003v1
+2409.09847v1
+2406.17651v5
+2405.17445v1
+2409.10836v1
+2401.14299v1
+2402.10194v1
+2410.12880v3
+2404.16381v1
+2406.02600v1
+2402.12684v1
+2410.17615v1
+2402.06041v1
+2406.00643v1
+2411.01655v1
+2412.05942v1
+2411.19791v1
+2412.07837v1
+2402.13944v2
+2409.01983v1
 '''.strip().splitlines()
-skip_ids = set([]) #set(np.array(skip_ids))
+skip_ids = set(skip_ids) #set([]) #
 
 
 
@@ -138,13 +214,18 @@ if __name__ == "__main__":
     
     
     #test_ids_df.head()
-    ids_2311_all = test_ids_df["arx_id"].unique()
+    test_ids_df['arx_id'].apply(lambda x: x.split('v')[0]).nunique()
+    split_df = pd.DataFrame.from_records(test_ids_df['arx_id'].str.split('v'), columns=['paper_id', 'version'])
+    dedup_df = split_df.groupby('paper_id')['version'].max().reset_index()
+    arx_ids = (dedup_df['paper_id']+'v'+dedup_df['version']).tolist()
     
-
     tt = TicToc()
 
-    input_ids = set(str(x) for x in ids_2311_all)
-    
+    input_ids = set(str(x) for x in arx_ids)
+    del test_ids_df
+    del split_df
+    del dedup_df
+    del arx_ids
 
     try:
         objects = []
@@ -201,9 +282,9 @@ if __name__ == "__main__":
         ]
     num_batches = sum(len(x) for x in mp_batches)
 
+    print(f"Start: {len(input_ids)} articles in {num_batches} batches")
     print(f"Start: {num_batches} batches in {len(mp_batches)} epochs")
     tt.tic()
-    print(f"Start: {len(input_ids)} in {num_batches} batches")
     
     with open(f"checkpoints/{save_name}_{sample_size}_{time_code}.pkl", 'ab') as cp_fp:
         for mp_batch in tqdm(mp_batches, desc="MP cycles", ncols=100):
