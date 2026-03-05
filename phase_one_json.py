@@ -46,8 +46,10 @@ PROJECT_ID = "arxiv-development"
 PRD_PROJECT = 'arxiv-production'
 PRD_BUCKET_LOC = 'arxiv-production-data' 
 
+GEMINI_MODEL="gemini-2.5-flash-lite"
+
 vertexai.init(project=PROJECT_ID, location="us-central1")
-model = GenerativeModel("gemini-2.0-flash-lite")
+model = GenerativeModel(GEMINI_MODEL)
 GEN_CONFIG =  GenerationConfig(
     temperature=0.0,  # Lower = more deterministic
     top_p=0.8,        # Lower = more focused, higher = more diverse
@@ -672,7 +674,7 @@ def query_gemini_api(input_text, **kwargs):
     Sends a request to the Gemini API to judge quality of result.
     """
     prompt = PROMPT_TEMPLATE.format(input_text=input_text)
-    if not 'generation_config'in kwargs:
+    if not 'generation_config' in kwargs:
         kwargs['generation_config'] = GEN_CONFIG
 
     start_time = time.time()
@@ -1008,7 +1010,7 @@ def load_special_cases_ror():
         for entry in spec:
             ror_id = entry.get("ror_id", "")
             name_loc = entry.get("name_loc", "")
-            if name and ror_id:
+            if name_loc and ror_id:
                 content = f"{name_loc} — {ror_id}"
                 docs.append(Document(page_content=content))
     except FileNotFoundError:
@@ -1041,8 +1043,8 @@ class rorFinder:
         self.ror_gspath = 'gs://institutional-extract-scratch/reference/v1.63-2025-04-03-ror-data_schema_v2.json'
         self.model_project = 'arxiv-development'
         self.model_bucket_loc = 'institutional-extract-scratch'
-        self.dest_blob_name = "models/ror_index_city_and_noncity_abbrev_county_withdrawn.zip"
-        self.local_index = "ror_index_city_and_noncity_abbrev_county_withdrawn"
+        self.dest_blob_name = "models/ror_index_city_country_and_noncity_abbrev_county_withdrawn.zip"
+        self.local_index = "ror_index_city_country_and_noncity_abbrev_county_withdrawn"
         self.withdrawn_map = None
         self.qa_chain = self.build_qa_chain()
         
@@ -1143,6 +1145,9 @@ class rorFinder:
                     else: 
                         no_loc_content = f"{name} — {ror_id}"
                         docs.append(Document(page_content=no_loc_content))
+                    if loc_name and ctry_name:
+                        content = f"{name}{loc_name}{ctry_name} — {ror_id}"
+                        docs.append(Document(page_content=content))                       
                     if loc_name:
                         content = f"{name}{loc_name} — {ror_id}"
                         docs.append(Document(page_content=content))
@@ -1185,7 +1190,7 @@ class rorFinder:
             )
 
         llm = VertexAI(
-        model_name="gemini-1.5-flash-002",   # "gemini-1.5-flash-002"
+        model_name=GEMINI_MODEL,   # "gemini-1.5-flash-002"
         temperature=0,
         max_output_tokens=512,
         )
@@ -1214,6 +1219,8 @@ class rorFinder:
         #     return cache_lookup
         try:
             inst_loc = inst_city
+            if inst_cntry:
+                inst_loc = f"{inst_loc}, {inst_cntry}"
             cap_count = sum(x.isupper() for x in inst_name)
             if len(inst_name) <= 3:
                 inst_loc = inst_cntry
